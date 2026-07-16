@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Generated outputs (regenerated on first run)
+figures/
+results/
+supplementary/*.png
+supplementary/*.csv
+supplementary/*.md
