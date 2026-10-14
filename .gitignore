@@ -14,3 +14,7 @@ results/
 supplementary/*.png
 supplementary/*.csv
 supplementary/*.md
+
+# Default output folders of the analysis, figure and table scripts
+runs/
+tables/

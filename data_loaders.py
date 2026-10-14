@@ -4,12 +4,10 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from __future__ import annotations
-
 """
-Data loaders for real biosignal datasets.
+Loader of the MNE sample auditory/visual EEG recording.
 
-Loads publicly available EEG and EMG datasets and returns them in the format:
+Returns the recording in the format:
     (data, event_indices, event_labels)
 
 where:
@@ -20,25 +18,18 @@ where:
 This matches the problem structure X = D*Phi + W, where events define when
 templates (columns of Phi) are placed into the signal via the dictionary D.
 
-Datasets:
-    1. EEG/ERP: MNE sample dataset (auditory/visual event-related potentials)
-       - 59 EEG channels, ~600 Hz, 4 event types, ~72 reps each
-    2. EMG: GrabMyo (PhysioNet) - surface EMG during hand gestures
-       - 16 forearm EMG channels, 2048 Hz, 17 gesture types, 7 reps each
+Dataset: MNE sample dataset (auditory/visual event-related potentials),
+59 EEG channels (EEG 053 marked bad), ~600 Hz, 4 event types, ~72 reps each.
 """
 
+from __future__ import annotations
 
 import os
-import re
-import zipfile
 from pathlib import Path
 
 import mne
+import mne.transforms
 import numpy as np
-
-import requests
-
-import wfdb
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +39,6 @@ import wfdb
 # not inside the repo. Override with the MNE_DATA env var if set.
 _DATA_DIR = Path(os.environ.get("MNE_DATA", Path.home() / "mne_data"))
 EEG_DIR = _DATA_DIR
-_EMG_DIR = _DATA_DIR / "emg"
 
 
 # ===================================================================
@@ -56,7 +46,7 @@ _EMG_DIR = _DATA_DIR / "emg"
 # ===================================================================
 
 
-def load_eeg_erp(
+def load_eeg_erp(  # noqa: C901
     data_dir: str | Path | None = None,
     pick_channels: str = "eeg",
     event_ids: dict[str, int] | None = None,
@@ -64,7 +54,13 @@ def load_eeg_erp(
     tmin: float = -0.2,
     tmax: float = 0.5,
     return_epochs: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | dict:
+    exclude_bads: bool = False,
+    return_info: bool = False,
+) -> (
+    tuple[np.ndarray, np.ndarray, np.ndarray]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]
+    | dict
+):
     """Load the MNE sample dataset as continuous multichannel EEG + events.
 
     The MNE sample dataset contains auditory and visual event-related potentials
@@ -79,9 +75,11 @@ def load_eeg_erp(
     Parameters
     ----------
     data_dir : path, optional
-        Root of the MNE-sample-data directory.  Defaults to data/eeg/.
+        Folder holding ``MNE-sample-data/``. Defaults to ``$MNE_DATA`` or
+        ``~/mne_data``.
     pick_channels : str
-        "eeg" (59 ch), "mag" (102 ch), "grad" (204 ch), or "all".
+        "eeg" (60 ch, including the marked bad EEG 053), "mag" (102 ch),
+        "grad" (204 ch), or "all".
     event_ids : dict, optional
         Mapping of event names to integer IDs to include.
         Default: {"aud_l": 1, "aud_r": 2, "vis_l": 3, "vis_r": 4}.
@@ -93,16 +91,31 @@ def load_eeg_erp(
     return_epochs : bool
         If True, return a dict with 'epochs' (N x C x T_epoch), 'labels',
         'times', and 'sfreq' instead of the continuous format.
+    exclude_bads : bool
+        If True, drop the picked channels listed in ``raw.info["bads"]``
+        (EEG 053 for "eeg", leaving 59 channels), in both output formats.
+    return_info : bool
+        If True, return ``{"ch_names": [...], "sfreq": float}`` as a fourth
+        value of the continuous format. Not allowed with return_epochs=True,
+        whose dict already holds 'ch_names' and 'sfreq'.
 
     Returns
     -------
     data : ndarray (T, C)
         Continuous multichannel data.
     event_indices : ndarray (N,)
-        Sample indices where events occur.
+        Zero-based sample indices relative to the returned data array.
     event_labels : ndarray (N,)
         Integer label for each event.
+    info : dict
+        Only with return_info=True: channel names and sampling rate of *data*.
     """
+
+    if return_info and return_epochs:
+        raise ValueError(
+            "return_info=True needs the continuous format: the return_epochs=True "
+            "dict already holds 'ch_names' and 'sfreq'"
+        )
 
     if data_dir is None:
         data_dir = EEG_DIR
@@ -114,8 +127,7 @@ def load_eeg_erp(
     if not fif_path.exists():
         raise FileNotFoundError(
             f"MNE sample data not found at {fif_path}. "
-            "Download it by running: "
-            "mne.datasets.sample.data_path(path='data/eeg')"
+            f"Download it with download_eeg_mne('{data_dir}')."
         )
 
     # Default event IDs: the 4 main stimulus types
@@ -142,6 +154,9 @@ def load_eeg_erp(
     else:
         raise ValueError(f"Unknown pick_channels={pick_channels}")
 
+    if exclude_bads:
+        raw.drop_channels(raw.info["bads"])
+
     # Apply bandpass filter
     if bandpass is not None:
         raw.filter(bandpass[0], bandpass[1], verbose=False)
@@ -160,7 +175,8 @@ def load_eeg_erp(
     data = raw.get_data().T  # raw.get_data() is (C, T), transpose to (T, C)
     sfreq = raw.info["sfreq"]
 
-    event_indices = events[:, 0]  # sample indices
+    # MNE events use absolute sample numbers; get_data() starts at first_samp.
+    event_indices = events[:, 0] - raw.first_samp
     event_labels = events[:, 2]  # event codes
 
     if return_epochs:
@@ -189,313 +205,49 @@ def load_eeg_erp(
             "event_ids": event_ids,
         }
 
+    if return_info:
+        info = {"ch_names": list(raw.ch_names), "sfreq": float(sfreq)}
+        return data, event_indices, event_labels, info
     return data, event_indices, event_labels
 
 
-# ===================================================================
-# EMG Loader  (GrabMyo - PhysioNet)
-# ===================================================================
+def load_eeg_positions(data_dir: str | Path | None = None) -> dict[str, object]:
+    """Channel positions of the MNE sample recording and the standard 10-05 montage.
 
-
-def load_emg_grabmyo(
-    data_dir: str | Path | None = None,
-    session: int = 1,
-    participant: int = 1,
-    gestures: list[int] | None = None,
-    use_forearm_only: bool = True,
-    bandpass: tuple[float, float] | None = (20.0, 500.0),
-    rectify: bool = False,
-    return_epochs: bool = False,
-    epoch_duration: float = 5.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | dict:
-    """Load GrabMyo EMG dataset from PhysioNet.
-
-    GrabMyo contains surface EMG recordings from 43 participants performing
-    17 hand gestures (including rest), with 7 repetitions per gesture per session.
-    Recordings use 16 forearm + 12 wrist channels (bipolar), sampled at 2048 Hz.
-
-    Each trial is a separate file containing ~5 seconds of EMG during one gesture.
-    We concatenate all trials into a continuous signal and mark gesture onsets.
-
-    Parameters
-    ----------
-    data_dir : path, optional
-        Directory containing the grabmyo/ folder.
-    session : int
-        Session number (1, 2, or 3).
-    participant : int
-        Participant number (1-43).
-    gestures : list of int, optional
-        Which gesture IDs to include (1-17). Default: all available.
-    use_forearm_only : bool
-        If True, use only the 16 forearm channels (drop wrist/unused).
-    bandpass : tuple or None
-        (low, high) Hz bandpass filter.
-    rectify : bool
-        If True, full-wave rectify after filtering (common for EMG analysis).
-    return_epochs : bool
-        If True, return dict with 'epochs' array instead of continuous data.
-    epoch_duration : float
-        Duration of each epoch in seconds (default 5.0, matching trial length).
-
-    Returns
-    -------
-    data : ndarray (T, C)
-        Continuous multichannel EMG data (all trials concatenated with rest gaps).
-    event_indices : ndarray (N,)
-        Sample indices where each gesture trial starts.
-    event_labels : ndarray (N,)
-        Gesture ID for each event.
+    Reads only the header of ``sample_audvis_raw.fif``. Returns a JSON-able dict:
+    ``recording`` (the file read), ``coord_frame`` ("head" when every EEG
+    channel is digitized in the head frame), ``channels`` {EEG channel: [x, y, z]} (m, head
+    frame), ``montage`` ("standard_1005") and ``standard_head`` (the montage placed in the head
+    frame by its fiducials with ``mne.transforms.get_ras_to_neuromag_trans``).
     """
-
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    from scipy.signal import butter, sosfiltfilt
-
-    if data_dir is None:
-        data_dir = _EMG_DIR
-
-    data_dir = Path(data_dir)
-    subj_dir = (
-        data_dir
-        / "grabmyo"
-        / f"Session{session}"
-        / f"session{session}_participant{participant}"
+    fif_path = (
+        Path(data_dir or EEG_DIR)
+        / "MNE-sample-data"
+        / "MEG"
+        / "sample"
+        / "sample_audvis_raw.fif"
     )
-
-    if not subj_dir.exists():
-        raise FileNotFoundError(
-            f"GrabMyo data not found at {subj_dir}. Run download_emg_grabmyo() first."
-        )
-
-    # Discover available gesture/trial files
-    hea_files = sorted(subj_dir.glob("*.hea"))
-    if not hea_files:
-        raise FileNotFoundError(f"No .hea files found in {subj_dir}")
-
-    # Parse filenames: session{s}_participant{p}_gesture{g}_trial{t}
-
-    trial_info: list[tuple[int, int, str]] = []  # (gesture, trial, record_path)
-    for hf in hea_files:
-        m = re.match(
-            r"session(\d+)_participant(\d+)_gesture(\d+)_trial(\d+)\.hea",
-            hf.name,
-        )
-        if m:
-            g, t = int(m.group(3)), int(m.group(4))
-            if gestures is None or g in gestures:
-                rec_path = str(hf.with_suffix(""))
-                trial_info.append((g, t, rec_path))
-
-    trial_info.sort()  # sort by gesture then trial
-
-    if not trial_info:
-        raise ValueError(f"No trials found for gestures={gestures} in {subj_dir}")
-
-    # Read all trials and concatenate
-    all_signals: list[np.ndarray] = []
-    event_indices_list: list[int] = []
-    event_labels_list: list[int] = []
-    current_offset = 0
-
-    # Read first record to get metadata
-    rec0 = wfdb.rdrecord(trial_info[0][2])
-    fs = rec0.fs
-    _ = rec0.n_sig
-    sig_names = rec0.sig_name
-
-    # Determine channel selection
-    if use_forearm_only:
-        # Forearm channels are the first 16 (8 bipolar pairs x 2 rings)
-        # Wrist channels are 16-27, unused are 28-31
-        ch_indices = list(range(16))
-    else:
-        # All 28 used channels (drop 4 unused)
-        ch_indices = list(range(28))
-
-    # Add rest gaps between trials (0.5 seconds of zeros)
-    rest_gap_samples = int(0.5 * fs)
-
-    for gesture_id, _trial_num, rec_path in trial_info:
-        rec = wfdb.rdrecord(rec_path)
-        sig = rec.p_signal[:, ch_indices]  # (T_trial, C)
-
-        # Record event onset
-        event_indices_list.append(current_offset)
-        event_labels_list.append(gesture_id)
-
-        all_signals.append(sig)
-        current_offset += sig.shape[0]
-
-        # Add rest gap
-        rest = np.zeros((rest_gap_samples, len(ch_indices)))
-        all_signals.append(rest)
-        current_offset += rest_gap_samples
-
-    data = np.vstack(all_signals)
-
-    # Apply bandpass filter
-    if bandpass is not None:
-        nyq = fs / 2.0
-        low = bandpass[0] / nyq
-        high = bandpass[1] / nyq
-        sos = butter(4, [low, high], btype="band", output="sos")
-        data = sosfiltfilt(sos, data, axis=0)
-
-    # Optionally rectify
-    if rectify:
-        data = np.abs(data)
-
-    event_indices = np.array(event_indices_list, dtype=int)
-    event_labels = np.array(event_labels_list, dtype=int)
-
-    if return_epochs:
-        n_epoch = int(epoch_duration * fs)
-        n_ch = data.shape[1]
-        valid = event_indices + n_epoch <= data.shape[0]
-        valid_idx = event_indices[valid]
-        valid_lbl = event_labels[valid]
-
-        epochs = np.zeros((len(valid_idx), n_ch, n_epoch))
-        for i, idx in enumerate(valid_idx):
-            epochs[i] = data[idx : idx + n_epoch, :].T
-
-        times = np.arange(n_epoch) / fs
-        return {
-            "epochs": epochs,
-            "labels": valid_lbl,
-            "times": times,
-            "sfreq": fs,
-            "ch_names": [sig_names[i] for i in ch_indices],
-            "gestures": sorted(set(event_labels_list)),
-        }
-
-    return data, event_indices, event_labels
-
-
-# ===================================================================
-# EMG Loader  (UCI EMG for Gestures)
-# ===================================================================
-
-
-def load_emg_uci(
-    data_dir: str | Path | None = None,
-    subjects: list[int] | None = None,
-    gestures: list[int] | None = None,
-    bandpass: tuple[float, float] | None = (20.0, 450.0),
-    return_epochs: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | dict:
-    """Load the UCI EMG for Gestures dataset.
-
-    This dataset has 36 subjects performing 6 hand gestures (+ rest),
-    with 8 EMG channels sampled at ~1000 Hz.
-
-    Note: only ~4 repetitions per gesture per subject, so this dataset
-    is best used by pooling across subjects.
-
-    Parameters
-    ----------
-    data_dir : path, optional
-        Directory containing EMG_data_for_gestures-master/.
-    subjects : list of int, optional
-        Which subjects to load (1-36). Default: [1, 2, 3, 4, 5].
-    gestures : list of int, optional
-        Which gesture IDs to include (1-6). Default: all.
-    bandpass : tuple or None
-        (low, high) Hz bandpass filter.
-    return_epochs : bool
-        If True, return segmented epochs.
-
-    Returns
-    -------
-    data : ndarray (T, C)
-        Continuous 8-channel EMG data.
-    event_indices : ndarray (N,)
-    event_labels : ndarray (N,)
-    """
-
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    from scipy.signal import butter, sosfiltfilt
-
-    if data_dir is None:
-        data_dir = _EMG_DIR
-
-    data_dir = Path(data_dir)
-    base = data_dir / "EMG_data_for_gestures-master"
-
-    if not base.exists():
-        raise FileNotFoundError(
-            f"UCI EMG dataset not found at {base}. "
-            "Download and extract emg_gestures.zip first."
-        )
-
-    if subjects is None:
-        subjects = [1, 2, 3, 4, 5]
-
-    all_signals: list[np.ndarray] = []
-    event_indices_list: list[int] = []
-    event_labels_list: list[int] = []
-    offset = 0
-
-    for subj in subjects:
-        subj_dir = base / f"{subj:02d}"
-        if not subj_dir.exists():
-            continue
-
-        txt_files = sorted(subj_dir.glob("*.txt"))
-        for fpath in txt_files:
-            raw = np.loadtxt(fpath, delimiter="\t", skiprows=1)
-            # Columns: time, ch1-ch8, class
-            emg_data = raw[:, 1:9]  # 8 EMG channels
-            labels = raw[:, -1].astype(int)
-
-            # Detect gesture onsets: transition from 0 (rest) to non-zero
-            for i in range(1, len(labels)):
-                if labels[i] != 0 and labels[i - 1] == 0:
-                    if gestures is None or labels[i] in gestures:
-                        event_indices_list.append(offset + i)
-                        event_labels_list.append(labels[i])
-
-            all_signals.append(emg_data)
-            offset += emg_data.shape[0]
-
-    if not all_signals:
-        raise ValueError("No data loaded. Check subject directories.")
-
-    data = np.vstack(all_signals)
-
-    # Estimate sampling rate from time column (approximately 1000 Hz)
-    fs = 1000.0
-
-    # Apply bandpass filter
-    if bandpass is not None:
-        nyq = fs / 2.0
-        low = bandpass[0] / nyq
-        high = bandpass[1] / nyq
-        sos = butter(4, [low, high], btype="band", output="sos")
-        data = sosfiltfilt(sos, data, axis=0)
-
-    event_indices = np.array(event_indices_list, dtype=int)
-    event_labels = np.array(event_labels_list, dtype=int)
-
-    if return_epochs:
-        epoch_len = int(3.0 * fs)  # 3 second epochs
-        n_ch = data.shape[1]
-        valid = event_indices + epoch_len <= data.shape[0]
-        valid_idx = event_indices[valid]
-        valid_lbl = event_labels[valid]
-
-        epochs = np.zeros((len(valid_idx), n_ch, epoch_len))
-        for i, idx in enumerate(valid_idx):
-            epochs[i] = data[idx : idx + epoch_len, :].T
-
-        return {
-            "epochs": epochs,
-            "labels": valid_lbl,
-            "times": np.arange(epoch_len) / fs,
-            "sfreq": fs,
-        }
-
-    return data, event_indices, event_labels
+    if not fif_path.exists():
+        raise FileNotFoundError(f"MNE sample data not found at {fif_path}")
+    raw = mne.io.read_raw_fif(str(fif_path), preload=False, verbose=False)
+    eeg = [
+        c for c in raw.info["chs"] if c["kind"] == mne.io.constants.FIFF.FIFFV_EEG_CH
+    ]
+    head = all(c["coord_frame"] == mne.io.constants.FIFF.FIFFV_COORD_HEAD for c in eeg)
+    pos = mne.channels.make_standard_montage("standard_1005").get_positions()
+    trans = mne.transforms.get_ras_to_neuromag_trans(
+        pos["nasion"], pos["lpa"], pos["rpa"]
+    )
+    return {
+        "recording": fif_path.name,
+        "coord_frame": "head" if head else "not head",
+        "channels": {c["ch_name"]: [float(v) for v in c["loc"][:3]] for c in eeg},
+        "montage": "standard_1005",
+        "standard_head": {
+            n: [float(v) for v in mne.transforms.apply_trans(trans, p)]
+            for n, p in pos["ch_pos"].items()
+        },
+    }
 
 
 # ===================================================================
@@ -516,154 +268,24 @@ def download_eeg_mne(data_dir: str | Path | None = None) -> Path:
     return Path(path)
 
 
-def download_emg_grabmyo(
-    data_dir: str | Path | None = None,
-    session: int = 1,
-    participant: int = 1,
-    gestures: list[int] | None = None,
-) -> Path:
-    """Download GrabMyo EMG data from PhysioNet for one participant."""
-
-    if data_dir is None:
-        data_dir = _EMG_DIR
-    data_dir = Path(data_dir)
-
-    subj_dir = (
-        data_dir
-        / "grabmyo"
-        / f"Session{session}"
-        / f"session{session}_participant{participant}"
-    )
-    subj_dir.mkdir(parents=True, exist_ok=True)
-
-    base_url = (
-        f"https://physionet.org/files/grabmyo/1.0.2/"
-        f"Session{session}/session{session}_participant{participant}"
-    )
-
-    if gestures is None:
-        gestures = list(range(1, 18))
-
-    downloaded = 0
-    skipped = 0
-    for g in gestures:
-        for t in range(1, 8):
-            fname_base = (
-                f"session{session}_participant{participant}_gesture{g}_trial{t}"
-            )
-            for ext in [".dat", ".hea"]:
-                fname = fname_base + ext
-                filepath = subj_dir / fname
-                if filepath.exists():
-                    skipped += 1
-                    continue
-                url = f"{base_url}/{fname}"
-                r = requests.get(url, timeout=60)
-                if r.status_code == 200:
-                    filepath.write_bytes(r.content)
-                    downloaded += 1
-                else:
-                    print(
-                        f"  Warning: failed to download {fname} (HTTP {r.status_code})"
-                    )
-
-    print(
-        f"GrabMyo: downloaded {downloaded} files, "
-        f"skipped {skipped} existing. Dir: {subj_dir}"
-    )
-    return subj_dir
-
-
-def download_emg_uci(data_dir: str | Path | None = None) -> Path:
-    """Download the UCI EMG for Gestures dataset."""
-
-    if data_dir is None:
-        data_dir = _EMG_DIR
-    data_dir = Path(data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    zip_path = data_dir / "emg_gestures.zip"
-    extracted = data_dir / "EMG_data_for_gestures-master"
-
-    if extracted.exists():
-        print(f"UCI EMG already extracted at {extracted}")
-        return extracted
-
-    if not zip_path.exists():
-        url = "https://archive.ics.uci.edu/static/public/481/emg+data+for+gestures.zip"
-        print(f"Downloading UCI EMG dataset from {url} ...")
-        r = requests.get(url, stream=True, timeout=120)
-        r.raise_for_status()
-        with open(zip_path, "wb") as f:
-            f.writelines(r.iter_content(chunk_size=8192))
-        print(f"  Saved to {zip_path} ({zip_path.stat().st_size / 1e6:.1f} MB)")
-
-    print("Extracting...")
-    with zipfile.ZipFile(zip_path, "r") as z:
-        z.extractall(data_dir)
-
-    print(f"UCI EMG extracted to {extracted}")
-    return extracted
-
-
 # ===================================================================
-# Summary / diagnostic
-# ===================================================================
-
-
-def summarize_dataset(
-    data: np.ndarray,
-    event_indices: np.ndarray,
-    event_labels: np.ndarray,
-    name: str = "Dataset",
-) -> None:
-    """Print a summary of a loaded dataset."""
-    print(f"\n{'=' * 60}")
-    print(f"  {name}")
-    print(f"{'=' * 60}")
-    print(f"  Data shape:         {data.shape}  (T x C)")
-    print(f"  Data dtype:         {data.dtype}")
-    print(f"  Data range:         [{data.min():.6g}, {data.max():.6g}]")
-    print(f"  Data mean (abs):    {np.abs(data).mean():.6g}")
-    print(f"  Num events:         {len(event_indices)}")
-    print(f"  Event index range:  [{event_indices.min()}, {event_indices.max()}]")
-
-    unique_labels, counts = np.unique(event_labels, return_counts=True)
-    print(f"  Event types:        {len(unique_labels)}")
-    for lbl, cnt in zip(unique_labels, counts):
-        print(f"    Label {lbl:3d}: {cnt:4d} events")
-    print(f"{'=' * 60}\n")
-
-
-# ===================================================================
-# Main: verify loaders
+# Main: verify the loader
 # ===================================================================
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  Data Loader Verification")
-    print("=" * 60)
-
-    # --- EEG/ERP ---
-    print("\n--- Loading EEG/ERP (MNE Sample) ---")
+    # The paper's EEG input: auditory left/right tones, 1-40 Hz, EEG 053 dropped.
     try:
-        eeg_data, eeg_events, eeg_labels = load_eeg_erp()
-        summarize_dataset(eeg_data, eeg_events, eeg_labels, "EEG/ERP (MNE Sample)")
+        eeg_data, eeg_events, eeg_labels, eeg_info = load_eeg_erp(
+            event_ids={"auditory_left": 1, "auditory_right": 2},
+            exclude_bads=True,
+            return_info=True,
+        )
     except FileNotFoundError as e:
-        print(f"  Skipped: {e}")
-
-    # --- EMG: GrabMyo ---
-    print("\n--- Loading EMG (GrabMyo) ---")
-    try:
-        emg_data, emg_events, emg_labels = load_emg_grabmyo()
-        summarize_dataset(emg_data, emg_events, emg_labels, "EMG (GrabMyo)")
-    except FileNotFoundError as e:
-        print(f"  Skipped: {e}")
-
-    # --- EMG: UCI ---
-    print("\n--- Loading EMG (UCI Gestures) ---")
-    try:
-        uci_data, uci_events, uci_labels = load_emg_uci()
-        summarize_dataset(uci_data, uci_events, uci_labels, "EMG (UCI Gestures)")
-    except FileNotFoundError as e:
-        print(f"  Skipped: {e}")
+        print(f"Skipped: {e}")
+    else:
+        print(f"EEG data {eeg_data.shape} (T x C), sfreq {eeg_info['sfreq']} Hz")
+        print(f"{len(eeg_events)} events")
+        for lbl, cnt in zip(*np.unique(eeg_labels, return_counts=True)):
+            print(f"  label {lbl}: {cnt} events")
+        positions = load_eeg_positions()
+        print(f"EEG positions in the {positions['coord_frame']} frame")

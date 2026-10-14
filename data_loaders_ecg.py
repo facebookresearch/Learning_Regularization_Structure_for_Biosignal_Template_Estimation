@@ -4,19 +4,15 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""ECG loader for the MIT-BIH Arrhythmia Database (PhysioNet).
+
+Downloads and loads ECG recordings with their annotated beats (R-peak sample and
+beat type) as (data, event_indices, event_labels). MIT-BIH contains 48 half-hour
+two-lead ECG recordings from 47 subjects, sampled at 360 Hz, with
+cardiologist-annotated beat labels.
+"""
+
 from __future__ import annotations
-
-"""
-ECG data loader for MIT-BIH Arrhythmia Database (PhysioNet).
-
-Downloads and loads ECG recordings, detects R-peaks, and returns data
-in the standard (data, event_indices, event_labels) format for template
-estimation benchmarks.
-
-MIT-BIH contains 48 half-hour two-lead ECG recordings from 47 subjects,
-sampled at 360 Hz, with cardiologist-annotated beat labels.
-"""
-
 
 import os
 from pathlib import Path
@@ -24,6 +20,7 @@ from pathlib import Path
 import numpy as np
 
 import wfdb
+from scipy.signal import butter, sosfiltfilt
 
 
 # MIT-BIH records live under the user's home MNE data dir, not in the repo.
@@ -111,9 +108,6 @@ def load_ecg_mitbih(
         Sampling frequency (360 Hz for MIT-BIH).
     """
 
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    from scipy.signal import butter, sosfiltfilt
-
     if data_dir is None:
         data_dir = _DATA_DIR
     data_dir = Path(data_dir)
@@ -195,32 +189,17 @@ def load_ecg_mitbih(
     return data, event_indices, event_labels, sfreq
 
 
-def load_ecg_single_record(
-    data_dir: str | Path | None = None,
-    record: str = "100",
-    lead: int = 0,
-    bandpass: tuple[float, float] | None = (0.5, 40.0),
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Load a single MIT-BIH record. Convenience wrapper."""
-    return load_ecg_mitbih(
-        data_dir=data_dir,
-        records=[record],
-        lead=lead,
-        bandpass=bandpass,
-        beat_types=["N"],
-    )
-
-
 if __name__ == "__main__":
     print("=" * 60)
     print("  ECG Data Loader Verification")
     print("=" * 60)
 
     print("\n--- Downloading MIT-BIH ---")
-    download_ecg_mitbih(records=["100", "101"])
+    download_ecg_mitbih(records=["119"])
 
-    print("\n--- Loading record 100 ---")
-    data, ix, lb, fs = load_ecg_single_record(record="100")
+    # The paper's ECG input: record 119, lead 0, 0.5-40 Hz, Normal and PVC beats.
+    print("\n--- Loading record 119 ---")
+    data, ix, lb, fs = load_ecg_mitbih(records=["119"], beat_types=["N", "V"])
     print(f"  Data shape: {data.shape}")
     print(f"  Sampling rate: {fs} Hz")
     print(f"  Num beats: {len(ix)}")
