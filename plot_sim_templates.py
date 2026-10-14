@@ -4,16 +4,15 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""
-Stacked-trace plot of the simulation templates (paper Figure 1).
+"""Stacked-trace plot of the simulation templates shown in the paper.
 
-Replaces the previous overlaid 8-channel plot, which hid the outer channels
-when their Hanning-window amplitude was small. Per-channel vertical offset,
-twilight palette, hidden y-ticks, t=0 reference line.
+Per-channel vertical offset, twilight palette, hidden y-ticks, t=0 reference
+line. Writes ``<out>/fig1b_templates.pdf`` and ``.png``.
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import matplotlib as mpl
@@ -21,23 +20,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 mpl.use("Agg")
+import figure_style  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
 from core import ricker
-
-PAPER_STYLE = {
-    "font.size": 9,
-    "font.family": "serif",
-    "axes.labelsize": 10,
-    "axes.titlesize": 10,
-    "legend.fontsize": 8,
-    "xtick.labelsize": 8,
-    "ytick.labelsize": 8,
-    "figure.dpi": 150,
-    "savefig.dpi": 300,
-    "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.05,
-    "axes.grid": True,
-    "grid.alpha": 0.3,
-}
 
 
 def make_real_templates(T: int = 100, C: int = 8) -> dict[str, NDArray]:
@@ -50,15 +35,10 @@ def make_real_templates(T: int = 100, C: int = 8) -> dict[str, NDArray]:
 
 def plot_stacked(
     templates: dict[str, NDArray],
+    out_dir: Path,
     scale: float = 0.75,
-    out_dir: Path | None = None,
 ) -> None:
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import matplotlib.pyplot as plt
-
-    if out_dir is None:
-        out_dir = Path(__file__).resolve().parent / "figures"
-    plt.rcParams.update(PAPER_STYLE)
+    plt.rcParams.update(figure_style.PAPER_RC)
 
     n_templates = len(templates)
     # Single-column. Pick figsize so the bbox-tight PDF width matches the other
@@ -112,11 +92,14 @@ def plot_stacked(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--out", default="./figures")
+    args = parser.parse_args()
     templates = make_real_templates(T=100, C=8)
     print("Templates:")
     for name, tpl in templates.items():
         print(f"  {name}: shape={tpl.shape}, peak={np.max(np.abs(tpl)):.4f}")
-    plot_stacked(templates)
+    plot_stacked(templates, Path(args.out))
 
 
 if __name__ == "__main__":

@@ -2,214 +2,229 @@
 
 Companion code for:
 
-> **Learning Regularization Structure for Biosignal Template Estimation**
-> Y. Morin, A. Gramfort (under review)
+> Y. Murin and A. Gramfort, "Learning Regularization Structure for Biosignal
+> Template Estimation," IEEE Transactions on Biomedical Engineering, under review.
 
-## Overview
+Event-locked templates are estimated by regularized least squares. SURE
+selects both the regularization structure (a learned convolution kernel) and
+its magnitude from the data, for white and AR(1) noise. The scripts below
+produce the numbers, tables and figures of the paper and its supplement.
 
-Estimating event-locked templates from biosignal recordings via regularized
-least-squares requires choosing both the regularization structure and its
-magnitude. This code implements a SURE-based framework that jointly optimizes
-both, learning the penalty kernel directly from the data.
-
-## Methods
+## Estimators
 
 | Name | Description |
 |------|-------------|
-| Average | Epoch averaging (baseline) |
-| OLS | Ordinary least-squares (no regularization) |
-| GCV | Generalized cross-validation λ selection |
-| L-curve | Maximum-curvature λ selection |
-| Emp. Bayes | MacKay's evidence maximization |
-| SURE(λ) | SURE-optimized λ with fixed [1,−2,1] kernel |
-| SURE(kernel) | SURE-optimized convolution kernel (proposed) |
+| Average | epoch averaging |
+| OLS | ordinary least squares |
+| GCV | generalized cross-validation choice of lambda |
+| L-curve | maximum-curvature choice of lambda |
+| Emp. Bayes | evidence maximization |
+| SURE(lambda) | SURE choice of lambda with the fixed [1, -2, 1] kernel |
+| SURE(kernel) | SURE choice of the convolution kernel (proposed) |
+| Molina et al. | filtered DTW average (P300 comparator) |
 
-## Datasets
+## Library modules
 
-- **EEG**: MNE sample dataset — auditory ERPs, 59 channels, 600 Hz
-- **MEG**: MNE sample dataset — auditory ERFs, 204 gradiometers, 600 Hz
-- **P300**: BNCI2014-009 — target/non-target BCI, 16 channels, 128 Hz
-- **ECG**: MIT-BIH record 119 — Normal + PVC beats, 1 channel, 360 Hz
+- `core.py`: the estimators, noise variance and AR(1) estimation, the design matrix and the simulated data.
+- `dtw_average.py`: the filtered DTW average of Molina et al. (2024).
+- `heldout_p300.py`: P300 held-out block evaluation: folds, selections, scoring, AUC, Population control.
+- `protocol.py`: estimator tables and the fixed settings of every analysis.
+- `analysis_tools.py`: shared analysis code: caches and selections, the fit failure policy, distances, statistics (signed-rank, bootstrap, Holm), reference noise, L-curve verticality, the R2.9 rules, the worker pool, JSON output and `run_info.json`.
+- `ar_tools.py`: AR(0)-AR(3) noise diagnostics (CLS fits, BIC, residual tests).
+- `data_loaders.py`, `data_loaders_p300.py`, `data_loaders_ecg.py`: loaders of the MNE sample EEG, BNCI2014-009 and MIT-BIH record 119.
+- `figure_style.py`: the paper's figure style.
 
-The MNE sample dataset (EEG + MEG) and the MIT-BIH ECG record download
-automatically on first use. The P300 dataset downloads via MOABB on first use.
-Datasets live in your home directory under `~/mne_data/` (the conventional MNE
-location) — `~/mne_data/MNE-sample-data/` for EEG/MEG and `~/mne_data/mitdb/`
-for the ECG record — not inside the repo. Override the base location with the
-`MNE_DATA` environment variable.
+The first six need only numpy, scipy and threadpoolctl. The scripts and
+loaders also need MNE, MOABB, wfdb and matplotlib.
 
-## Installation
-
-All scripts are plain Python and run directly from this folder — no build
-system required. Create the conda environment from the provided file:
+## Installation and data
 
 ```bash
 conda env create -f environment.yml
 conda activate template-estimation
 ```
 
-This installs numpy, scipy, pandas, matplotlib, scikit-learn, MNE (EEG/MEG),
-MOABB (P300), and wfdb (ECG).
-
-## Data setup
-
-All datasets are stored **outside the repo**, in your home directory under
-`~/mne_data/` (the conventional MNE location). Set the `MNE_DATA` environment
-variable to use a different base directory.
-
-| Dataset | Location | Download |
-|---------|----------|----------|
-| EEG / MEG (MNE sample) | `~/mne_data/MNE-sample-data/` | automatic on first use (`mne.datasets.sample.data_path`) |
-| P300 (BNCI2014-009) | `~/mne_data/MNE-bnci-data/` | automatic on first use (MOABB) |
-| ECG (MIT-BIH rec. 119) | `~/mne_data/mitdb/` | automatic on first use (`wfdb.dl_database`) |
-
-`run_benchmarks.py` auto-downloads the ECG record via `wfdb.dl_database`, which
-spawns a worker pool. In restricted/sandboxed shells that pool can fail with a
-`PermissionError` from `multiprocessing`. If that happens, pre-download the
-record once in a normal shell:
+The pins in `environment.yml` are the versions the results were reproduced
+with. Run every script from this folder with one BLAS thread:
 
 ```bash
-python -c "import wfdb; from pathlib import Path; \
-d = Path.home()/'mne_data'/'mitdb'; d.mkdir(parents=True, exist_ok=True); \
-wfdb.dl_database('mitdb', str(d), records=['119'])"
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 ```
 
-The loader skips the download when `~/mne_data/mitdb/119.{dat,hea,atr}` already
+Data live outside the repo, under `--data-dir` (default `$MNE_DATA`, else
+`~/mne_data`), and download on first use (except in
+`supplementary/run_numerical_stability.py`; see below):
+
+| Dataset | Location under the data dir | Download |
+|---------|-----------------------------|----------|
+| Auditory EEG (MNE sample) | `MNE-sample-data/` | `mne.datasets.sample` |
+| P300 (BNCI2014-009) | `MNE-bnci-data/` | MOABB |
+| ECG (MIT-BIH record 119) | `mitdb/` | `wfdb.dl_database` |
+
+`wfdb.dl_database` starts a worker pool, which some sandboxed shells refuse
+(`PermissionError` from `multiprocessing`). Then copy `119.dat`, `119.hea` and
+`119.atr` from PhysioNet into `mitdb/`; the loader skips the download when they
 exist.
 
-## Directory Structure
+## Analysis scripts
 
-```
-environment.yml                      # Conda environment definition
-core.py                              # All estimation algorithms
-data_loaders.py                      # EEG/MEG loader (MNE sample)
-data_loaders_p300.py                 # P300 loader (BNCI2014-009)
-data_loaders_ecg.py                  # ECG loader (MIT-BIH)
-run_benchmarks.py                    # Reproduce all result CSVs (results/)
-generate_metric_figures.py           # Distance-vs-K figures (Fig 3, 4, 6, 7, EEG)
-generate_template_kernel_figures.py  # Synthetic templates, kernel frequency response
-plot_sim_templates.py                # Fig 1b — simulated templates
-plot_colored_noise_sim.py            # Fig 5 — colored-noise simulation
-plot_template_eeg.py                 # EEG auditory L/R ERP template figures
-plot_kernels_cross_dataset.py        # Cross-dataset kernel frequency response
-plot_meg_combined.py                 # MEG combined (filtered / no-filter) example
-plot_template_composite.py           # Cross-modality template composite
-example_ecg_template.py              # ECG (Normal / PVC) template example
-results/                             # Generated CSVs (created on first run)
-figures/                             # Generated PDFs/PNGs (created on first run)
-tests/test_core.py                   # Unit tests
-supplementary/                       # Supplementary analyses (compute + plot)
-    run_convergence_analysis.py      #   SURE kernel optimizer convergence (data)
-    plot_convergence_kernels.py      #   convergence figure
-    run_phi_sensitivity.py           #   AR(1) coefficient sensitivity (data)
-    plot_phi_sensitivity.py          #   AR(1) coefficient sensitivity (figure)
-    run_numerical_stability.py       #   numerical stability at high phi (data)
-    plot_stability_condition_numbers.py  # numerical-stability figure
-    run_multi_subject_p300.py        #   10-subject P300 validation table
-```
+Each script writes `<out>/<analysis>/` (default `--out ./runs`) with
+`per_fit.csv` (one row per fit), `summary.json` (every number the manuscript
+cites from that analysis) and `run_info.json` (commit, arguments and settings,
+package versions, BLAS threads, host, start and end time), plus the files
+listed. `--workers N` sets the number of worker processes (default 1; not on
+`run_timing.py`, which runs serially); `--subjects` (P300 scripts) and `--reps`
+(selections per K, or simulation repetitions) select a quick slice.
+`run_timing.py --reps` is the number of timed calls.
 
-All scripts use folder-local imports (`from core import ...`) and write their
-outputs into `figures/` and `results/` next to this README. Run them from this
-directory.
+| Script | Inputs | Writes (besides the three files) | Serves |
+|--------|--------|----------------------------------|--------|
+| `run_p300.py` | BNCI2014-009 | `p300/`: `cache/`, `references/`, `population/`, `selections.json`, `fits/` | Table II; Figs. 4(a, b), 6, 7; Secs. III-D (phi), V-C; supplement: P300 statistical tests and per-subject results |
+| `run_reference_noise.py` | `runs/p300/` | `reference_noise/`: `references_uV.npz` | Secs. V-C (rank, reference noise, Remark 2), VI-D; supplement: P300 protocol (conditioning), why a trivial template can be closer, squared-domain table |
+| `run_p300_sensitivity.py` | `runs/p300/`, BNCI2014-009 | `p300_colored_factorial/`, `p300_q_symmetry/`, `p300_phi_variance/`: `templates.npz` (`p300_phi_variance/` also `bw1-30/`) | Secs. VI-A (ridge ablation), VI-B (phi); supplement: kernel length/symmetry and convergence, colored-noise P300 factorial, sensitivity to phi and the noise variance |
+| `run_noise_diagnostics.py` | `runs/p300/selections.json`, BNCI2014-009, MNE sample, MIT-BIH | `noise_diagnostics/`: `inputs/` | Sec. VI-B; supplement: noise-model diagnostics and noise inputs |
+| `run_r29.py` | `runs/p300/`, BNCI2014-009 | `r29/` | Remark 3 (Sec. V-C); supplement: what the held-out AUC measures, template-implied probabilities (post hoc) |
+| `run_simulations.py` | none | `white_sims/`, `calibration/`, `colored_factorial/`, `q_symmetry/`, `known_covariance/`: `templates.npz` | Figs. 2, 3, 7; Sec. IV-C; supplement: noise level, kernel length/symmetry and convergence, colored-noise factorial and known covariance, reference rankings with a known truth |
+| `run_real_data.py` | MNE sample, MIT-BIH | `real_data/`: `cache/`, `selections.json`, `references/`, `fits/` | Table I; Figs. 4(c, d), 5, 7; Secs. III-D (phi), V-B, V-D; supplement: EEG and ECG under all references, additional template waveforms |
+| `run_timing.py` | MNE sample | `timing/` | Sec. VI-C; supplement: computation time |
 
-## Reproducing the paper figures
+The figure and table scripts read these folders and write `./figures` and
+`./tables` (`--out`):
 
-Run everything from inside this folder with the `template-estimation` env
-active.
+| Script | Writes |
+|--------|--------|
+| `make_figures.py` | `<name>.pdf`, `.png` for each figure it draws (below), and `fig_kernels_magnitude.json` (the kernel numbers the text cites) |
+| `make_tables.py` | `<name>.tex` for each table it writes (below) |
+| `plot_templates.py` | `fig_templates_real`, `figS_templates_eeg` (and `.json` with the subject/channel selection) |
+| `plot_sim_templates.py` | `fig1b_templates` |
 
-```bash
-# 1. Unit tests
-python -m pytest tests/test_core.py
+## Paper figures
 
-# 2. Benchmarks — writes results/*_final2.csv (EEG, P300, ECG, simulations)
-python run_benchmarks.py
+| Figure | File | Drawn by | From |
+|--------|------|----------|------|
+| Fig. 1 | `fig1b_templates.pdf` | `plot_sim_templates.py` | none |
+| Fig. 2 | `fig_sim_nevents_sweep.pdf` | `make_figures.py` | `white_sims` |
+| Fig. 3 | `fig_sim_colored_simple.pdf` | `make_figures.py` | `colored_factorial` |
+| Fig. 4 | `fig_templates_real.pdf` | `plot_templates.py` | `p300`, `real_data` |
+| Fig. 5 | `fig_eeg_ecg_baselines.pdf` | `make_figures.py` | `real_data` |
+| Fig. 6 | `fig_p300_kcurve_2panel.pdf` | `make_figures.py` | `p300` |
+| Fig. 7 | `fig_kernels_magnitude.pdf` | `make_figures.py` | `p300`, `real_data`, `white_sims` |
 
-# 3. Distance-vs-K figures — reads results/*_final2.csv; writes fig3, fig4,
-#    fig6_p300, fig7_ecg, fig_eeg
-python generate_metric_figures.py
+Supplement:
 
-# 4. Synthetic templates + kernel frequency response
-python generate_template_kernel_figures.py
+| Figure | File | Drawn by | From |
+|--------|------|----------|------|
+| Fig. S1 | `figS_sim_noise_sweep.pdf` | `make_figures.py` | `white_sims` |
+| Fig. S2 | `fig_sim_colored_factorial.pdf` | `make_figures.py` | `colored_factorial` |
+| Fig. S3 | `figS_stability_condition_numbers.pdf` | `supplementary/plot_stability_condition_numbers.py` | `numerical_stability` |
+| Fig. S4 | `figS_templates_eeg.pdf` | `plot_templates.py` | `real_data` |
 
-# 5. Fig 1b — simulated templates
-python plot_sim_templates.py
+## Paper tables
 
-# 6. Fig 5 — colored-noise simulation (computes results/colored_noise_sim_noise01.csv
-#    on first run, then plots)
-python plot_colored_noise_sim.py
+`make_tables.py` writes `<name>.tex`. Tables I and II and the squared-domain
+table are the tabulars the manuscripts hold inline; the other files are the
+supplement's `\input{supp_tables/<name>}` files.
 
-# 7. EEG auditory L/R ERP template figures
-python plot_template_eeg.py
+| Table | File | From |
+|-------|------|------|
+| Table I | `tab_summary.tex` | `real_data` |
+| Table II | `tab_p300_k5.tex` | `p300` |
 
-# 8. Cross-dataset kernel frequency response
-python plot_kernels_cross_dataset.py
+Supplement, in order of appearance:
 
-# 9. MEG combined — broadband, and 1-30 Hz with --filtered
-python plot_meg_combined.py
-python plot_meg_combined.py --filtered
+| Label | File | From |
+|-------|------|------|
+| `tab:sup_q5_conv` | `b3_q5_convergence.tex` | `q_symmetry`, `p300_q_symmetry` |
+| `tab:sup_kernel_p300` | `b3_kernel_p300.tex` | `p300_q_symmetry` (Q1 row: `per_fit.csv`) |
+| `tab:sup_colored_p300` | `b3_colored_p300.tex` | `p300_colored_factorial` |
+| `tab:sup_known_cov` | `b3_known_cov.tex` | `known_covariance` |
+| `tab:sup_calibration` | `b3_calibration.tex` | `calibration` |
+| `tab:sup_eeg_ecg` | `b3_eeg_ecg_k5.tex` | `real_data` |
+| `tab:sup_families` | `families.tex` | `p300` |
+| `tab:sup_subjects` | `subjects.tex` | `p300` |
+| `tab:sup_squared` | `tab_sup_squared.tex` | `reference_noise` |
+| `tab:sup_gap` | `r29_gap.tex` | `r29` |
+| `tab:sup_prob` | `r29_prob.tex` | `r29` |
+| `tab:sup_diff` | `r29_diff.tex` | `r29` |
+| `tab:sup_noise_model` | `b3_noise_model.tex` | `noise_diagnostics` |
+| `tab:sup_phi` | `b3_phi_variance.tex` | `p300_phi_variance` |
+| `tab:sup_timing` | `b3_timing.tex` | `timing` |
 
-# 10. Cross-modality template composite
-python plot_template_composite.py
+## Run order and commands
 
-# 11. ECG template example (choose the beat type used in the paper)
-python example_ecg_template.py --beat-type PVC
-```
-
-### Paper figure map
-
-Each script writes the figure under the exact name the paper uses. The
-correspondence between each paper figure and the script that produces it:
-
-| Paper figure | Script | Output in `figures/` |
-|--------------|--------|----------------------|
-| Fig. 1b — simulated templates | `plot_sim_templates.py` | `fig1b_templates.pdf` |
-| Fig. 3 — noise sweep | `generate_metric_figures.py` | `fig3_noise_sweep.pdf` |
-| Fig. 4 — n-events sweep | `generate_metric_figures.py` | `fig4_nevents_sweep.pdf` |
-| Fig. 5 — colored-noise simulation | `plot_colored_noise_sim.py` | `fig5_colored_noise_sim.pdf` |
-| Fig. 6 — P300 | `generate_metric_figures.py` | `fig6_p300.pdf` |
-| Fig. 7 — ECG | `generate_metric_figures.py` | `fig7_ecg.pdf` |
-| EEG distance | `generate_metric_figures.py` | `fig_eeg.pdf` |
-| EEG auditory L/R templates | `plot_template_eeg.py` | `fig_template_eeg_aud_L.pdf`, `fig_template_eeg_aud_R.pdf` |
-| Cross-dataset kernels | `plot_kernels_cross_dataset.py` | `fig_kernels_cross_dataset.pdf` |
-| MEG combined (filtered / no-filter) | `plot_meg_combined.py` (`--filtered`) | `fig_meg_combined_filtered.pdf`, `fig_meg_combined_nofilter.pdf` |
-| Template composite | `plot_template_composite.py` | `fig_template_composite.pdf` |
-| ECG template (PVC) | `example_ecg_template.py --beat-type PVC` | `fig_template_ecg_pvc.pdf` |
-| Convergence (supplementary) | `supplementary/run_convergence_analysis.py` → `plot_convergence_kernels.py` | `convergence_kernels.pdf` |
-| φ sensitivity (supplementary) | `supplementary/run_phi_sensitivity.py` → `plot_phi_sensitivity.py` | `phi_sensitivity.pdf` |
-| Numerical stability (supplementary) | `supplementary/plot_stability_condition_numbers.py` | `stability_condition_numbers.pdf` |
-
-The supplementary analyses follow a **compute → plot** split: each `run_*.py`
-writes its data CSV into `supplementary/`, and the matching `plot_*.py` renders
-the figure into `figures/`. The plot scripts also recompute the CSV on the fly
-if it is absent.
-
-### Supplementary analyses (`supplementary/`)
+`run_p300.py` runs first: `run_reference_noise.py`, `run_p300_sensitivity.py`,
+`run_noise_diagnostics.py` and `run_r29.py` read its output. `run_simulations.py`
+and `run_real_data.py` are independent. `run_timing.py` measures wall-clock time:
+run it alone on an idle machine, after the others. It reads the CPU model from
+`/proc/cpuinfo`, so it runs on Linux only. The figures and tables come last.
 
 ```bash
-# Convergence
-python supplementary/run_convergence_analysis.py && python supplementary/plot_convergence_kernels.py
-# phi sensitivity
-python supplementary/run_phi_sensitivity.py && python supplementary/plot_phi_sensitivity.py
-# Numerical stability
-python supplementary/plot_stability_condition_numbers.py
-# 10-subject P300 validation table
-python supplementary/run_multi_subject_p300.py
+python3 -B run_p300.py --workers 8
+python3 -B run_reference_noise.py --workers 8
+python3 -B run_p300_sensitivity.py --workers 8
+python3 -B run_noise_diagnostics.py --selections runs/p300/selections.json --workers 8
+python3 -B run_r29.py --workers 8
+python3 -B run_simulations.py --workers 8
+python3 -B run_real_data.py --workers 8
+python3 -B run_timing.py
+
+python3 -B make_figures.py
+python3 -B make_tables.py
+python3 -B plot_templates.py
+python3 -B plot_sim_templates.py
 ```
 
-### Notes / caveats
+Defaults: `--data-dir` `$MNE_DATA` or `~/mne_data`; `--out ./runs` for the
+analysis scripts; `--p300` (`run_reference_noise.py`, `run_r29.py`)
+`./runs/p300`; `--central` (`run_p300_sensitivity.py`) `<out>/p300`; `--runs
+./runs` (`make_figures.py`, `make_tables.py`, `plot_templates.py`); `--out
+./figures` for the figure scripts and `./tables` for `make_tables.py`.
+`make_figures.py` and `make_tables.py` take figure or table names as positional
+arguments (`--help` lists them); `run_simulations.py --analyses`,
+`run_p300_sensitivity.py --analyses`, `run_real_data.py --datasets` and
+`run_timing.py --configs` run a subset.
 
-- `generate_metric_figures.py` consumes the `*_final2.csv` files produced by
-  `run_benchmarks.py`; run the benchmarks first.
-- Monte-Carlo results are seeded (`np.random.RandomState(42)`), so re-running
-  `run_benchmarks.py` reproduces the committed numbers exactly.
-- `supplementary/` `run_*.py` scripts write their data CSVs next to themselves
-  inside `supplementary/`; the matching `plot_*.py` scripts write figures into
-  `figures/`.
-- The ECG download uses `wfdb.dl_database`, which spawns a worker pool. In some
-  sandboxed shells that pool cannot be created; if you hit a `PermissionError`
-  from `multiprocessing`, fetch record 119 manually from PhysioNet
-  (`119.dat/.hea/.atr` into `~/mne_data/mitdb/`) and re-run — the loader skips
-  the download when the files already exist.
+A quick slice of the P300 chain (2 selections per K; `run_r29.py` needs the
+Population control, which `run_p300.py` builds from the other subjects):
+
+```bash
+python3 -B run_p300.py --subjects 1 2 --reps 2 --out /tmp/slice
+python3 -B run_reference_noise.py --p300 /tmp/slice/p300 --subjects 1 --reps 2 --out /tmp/slice
+python3 -B run_p300_sensitivity.py --central /tmp/slice/p300 --subjects 1 --reps 2 --out /tmp/slice
+python3 -B run_noise_diagnostics.py --selections /tmp/slice/p300/selections.json --subjects 1 --reps 2 --channels 2 --out /tmp/slice
+python3 -B run_r29.py --p300 /tmp/slice/p300 --subjects 1 --reps 2 --out /tmp/slice
+```
+
+Statistics that a slice leaves undefined are `null` or a nonfinite value
+written as a string (`"nan"`, `"inf"`) in `summary.json`, and `n/a` or not
+drawn in the tables and figures.
+
+## Supplementary: numerical stability
+
+```bash
+python3 -B supplementary/run_numerical_stability.py --workers 4
+python3 -B supplementary/plot_stability_condition_numbers.py
+```
+
+`supplementary/run_numerical_stability.py` does not download the EEG and ECG
+data: run `run_real_data.py` first with the same `--data-dir` (it downloads the
+MNE sample data and MIT-BIH record 119). MOABB downloads BNCI2014-009 when needed.
+It writes `runs/numerical_stability/`
+(`results/<config>.json`, `summary.json`, `run_info.json`);
+`supplementary/plot_stability_condition_numbers.py` reads `results/EEG.json`
+there and writes `runs/numerical_stability/figS_stability_condition_numbers.pdf`
+(`--results`, `--out` override both paths). The eigenvalues depend in their last
+bits on the workers' BLAS thread count (`--blas-threads`, default 1; the paper's
+run used 4, and 16 for `--configs BRIDGE`).
+
+## Tests
+
+Standalone, from this folder:
+
+```bash
+OPENBLAS_NUM_THREADS=1 python3 -B -m unittest discover -s tests
+OPENBLAS_NUM_THREADS=1 python3 -B -m pytest tests -q
+```
 
 ## License
 

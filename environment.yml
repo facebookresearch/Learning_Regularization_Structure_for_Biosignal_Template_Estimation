@@ -1,33 +1,23 @@
 # Conda environment for "Learning Regularization Structure for Biosignal
 # Template Estimation" (companion code).
 #
-# Create and activate with:
 #     conda env create -f environment.yml
 #     conda activate template-estimation
 #
-# Then run any script directly from this folder, e.g.:
-#     python plot_sim_templates.py
-#
-# Tested with Python 3.13 on macOS (Apple Silicon). The pinned versions are the
-# ones the figures were last regenerated with; relax them if conda cannot solve.
+# The pins are the versions the paper's results were reproduced with (Python
+# 3.12); the bitwise reproduction depends on numpy and scipy.
 name: template-estimation
 channels:
   - conda-forge
 dependencies:
-  - python=3.13
-  # --- core numerical / plotting stack ---
-  - numpy>=2.2
-  - scipy>=1.16
-  - pandas>=2.3
-  - matplotlib>=3.10
-  - scikit-learn>=1.5
-  # --- biosignal I/O ---
-  - mne>=1.8          # EEG/MEG sample dataset + filtering (EEG & MEG examples)
-  - requests>=2.31    # dataset downloads
-  - pytest>=8.0       # test suite (tests/test_core.py)
-  # --- packages not on conda-forge: installed via pip ---
+  - python=3.12
+  - numpy=2.4.4
+  - scipy=1.17.1
+  - threadpoolctl=3.6.0
+  - matplotlib=3.10.9
+  - mne=1.12.1        # auditory EEG (MNE sample) and P300 preprocessing
+  - pytest=9.0.3      # tests only
   - pip
   - pip:
-      - moabb>=1.5     # P300 BNCI2014-009 loader (data_loaders_p300.py)
-      - pyriemann>=0.6 # pulled in by moabb
-      - wfdb>=4.3      # MIT-BIH ECG loader (data_loaders_ecg.py)
+      - moabb==1.5.0  # P300 BNCI2014-009 (data_loaders_p300.py)
+      - wfdb==4.3.1   # MIT-BIH ECG record 119 (data_loaders_ecg.py)

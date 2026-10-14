@@ -4,14 +4,18 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+
 from __future__ import annotations
+
+import warnings
+from typing import NamedTuple
+
+import scipy
+import scipy as sp
+from scipy import signal as sig
 
 """
 Core template estimation methods.
-
-Extracted from the research notebook:
-"Optimizing L2-Norm Regularization with Application to Estimating Event Templates"
-(Yonathan Morin, Oct. 2022)
 
 This module implements:
 - OLS template estimation
@@ -24,13 +28,9 @@ This module implements:
 - Data generation utilities for simulations
 """
 
-from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
-
-if TYPE_CHECKING:
-    import scipy.sparse
 
 
 def ricker(points: int, a: float) -> NDArray:
@@ -101,7 +101,8 @@ def get_design_matrix(
 
     Each column is a shifted indicator for one time-sample of one event type.
     The matrix can be returned as dense or sparse depending on size and the
-    *sparse_out* flag.
+    *sparse_out* flag. Complete windows ending exactly at the data length
+    are included.
 
     Parameters
     ----------
@@ -123,19 +124,19 @@ def get_design_matrix(
     NDArray | scipy.sparse.csr_matrix
         Design matrix of shape ``(T, n_events * 2 * half_win)``.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
 
     if events is None:
         events = np.unique(lb)
 
     T = len(data)
+    # pyrefly: ignore [bad-argument-type]
     n_cols = len(events) * 2 * half_win
 
     if sparse_out or T * n_cols > 50_000_000:
         rows, cols = [], []
+        # pyrefly: ignore [not-iterable]
         for ii, ev in enumerate(events):
-            sel = (lb == ev) & (ix < (T - half_win))
+            sel = (lb == ev) & (ix <= (T - half_win))
             if sel.sum() > 0:
                 sel_ix = ix[sel]
                 for kk in range(2 * half_win):
@@ -147,8 +148,9 @@ def get_design_matrix(
         return sp.sparse.csr_matrix((data_vals, (rows, cols)), shape=(T, n_cols))
 
     design = np.zeros((T, n_cols))
+    # pyrefly: ignore [not-iterable]
     for ii, ev in enumerate(events):
-        sel = (lb == ev) & (ix < (T - half_win))
+        sel = (lb == ev) & (ix <= (T - half_win))
         if sel.sum() > 0:
             for kk in range(2 * half_win):
                 design[ix[sel] + kk - half_win, kk + ii * (2 * half_win)] = 1
@@ -250,147 +252,6 @@ def calculate_snr(
 
 
 # --- SURE cost functions ---
-
-
-def calc_G(DtD: NDArray, regval: float, S: NDArray, D: NDArray) -> NDArray:
-    """Compute the regularized gain matrix G = (D^T D + lam * S)^{-1} D^T.
-
-    Parameters
-    ----------
-    DtD : NDArray
-        Gram matrix ``D^T D`` of shape ``(p, p)``.
-    regval : float
-        Regularization parameter (lambda).
-    S : NDArray
-        Penalty matrix of shape ``(p, p)``.
-    D : NDArray
-        Design matrix of shape ``(n, p)``.
-
-    Returns
-    -------
-    NDArray
-        Gain matrix of shape ``(p, n)``.
-    """
-    return np.linalg.inv((DtD) + regval * S) @ D.T
-
-
-def calc_Gx(G: NDArray, X: NDArray) -> NDArray:
-    """Compute the regularized estimate G @ X.
-
-    Parameters
-    ----------
-    G : NDArray
-        Gain matrix of shape ``(p, n)``.
-    X : NDArray
-        Data matrix of shape ``(n, C)``.
-
-    Returns
-    -------
-    NDArray
-        Product of shape ``(p, C)``.
-    """
-    return G @ X
-
-
-def calc_Gtilde(G: NDArray, Dpinv: NDArray) -> NDArray:
-    """Compute G-tilde = G^T @ D^+.
-
-    Parameters
-    ----------
-    G : NDArray
-        Gain matrix of shape ``(p, n)``.
-    Dpinv : NDArray
-        Pseudoinverse of the design matrix of shape ``(p, n)``.
-
-    Returns
-    -------
-    NDArray
-        Product of shape ``(n, n)``.
-    """
-    return G.T @ Dpinv
-
-
-def calc_trace_term(G: NDArray, Dpinv: NDArray, sigsq: float) -> float:
-    """Compute the SURE trace term ``2 * sigma^2 * tr(G^T D^+)``.
-
-    Parameters
-    ----------
-    G : NDArray
-        Gain matrix of shape ``(p, n)``.
-    Dpinv : NDArray
-        Pseudoinverse of the design matrix of shape ``(p, n)``.
-    sigsq : float
-        Noise variance estimate.
-
-    Returns
-    -------
-    float
-        Scalar trace term.
-    """
-    return 2 * sigsq * np.multiply(G, Dpinv).sum()
-
-
-def calc_normvec(
-    Gx: NDArray,
-    trace_term: float,
-    omega: float,
-    G: NDArray,
-    sigsq: float,
-) -> NDArray:
-    """Compute the per-channel SURE norm vector.
-
-    Parameters
-    ----------
-    Gx : NDArray
-        Regularized estimate ``G @ X`` of shape ``(p, C)``.
-    trace_term : float
-        Precomputed trace term from :func:`calc_trace_term`.
-    omega : float
-        SURE weighting parameter (0.5 gives Stein's unbiased estimate).
-    G : NDArray
-        Gain matrix of shape ``(p, n)``.
-    sigsq : float
-        Noise variance estimate.
-
-    Returns
-    -------
-    NDArray
-        1-D array of length *C* with the per-channel norm contribution.
-    """
-    G_correction = 0
-    if np.abs(omega - 0.5) > 1e-5:
-        G_correction = (2 * omega - 1) * sigsq * np.multiply(G, G).sum()
-    return omega * (np.linalg.norm(Gx, axis=0) ** 2 + trace_term) - G_correction
-
-
-def calc_cost(
-    norm_vec: NDArray,
-    X: NDArray,
-    G: NDArray,
-    DpinvX: NDArray,
-    omega: float,
-) -> float:
-    """Compute the total SURE cost from the norm vector and cross-term.
-
-    Parameters
-    ----------
-    norm_vec : NDArray
-        Per-channel norm vector of length *C*.
-    X : NDArray
-        Data matrix of shape ``(n, C)``.
-    G : NDArray
-        Gain matrix of shape ``(p, n)``.
-    DpinvX : NDArray
-        ``D^+ @ X`` of shape ``(p, C)``.
-    omega : float
-        SURE weighting parameter.
-
-    Returns
-    -------
-    float
-        Scalar SURE cost.
-    """
-    return np.sum(norm_vec - omega * 2 * np.diagonal(X.T @ G.T @ DpinvX))
 
 
 def SURE_cost_fast(
@@ -659,11 +520,27 @@ def precompute_colored_trace(
     }
 
 
+def _resolve_acf_max_lag(half_win: int, max_lag: int | None) -> int:
+    """Validate the output horizon independently of the fitted AR moments."""
+    if max_lag is None:
+        return 4 * half_win
+    if not isinstance(max_lag, (int, np.integer)):
+        raise ValueError(  # noqa: TRY004 - Preserve the public ValueError contract.
+            "max_lag must be an integer or None, "
+            f"got {max_lag!r} (type={type(max_lag).__name__})"
+        )
+    if max_lag < 0:
+        raise ValueError(f"max_lag must be nonnegative, got {max_lag!r}")
+    return int(max_lag)
+
+
 def estimate_acf_ar(
     data: NDArray,
     ix: NDArray,
     half_win: int,
     ar_order: int = 3,
+    *,
+    max_lag: int | None = None,
 ) -> NDArray:
     """Estimate noise autocorrelation function via AR(p) model from baselines.
 
@@ -680,12 +557,19 @@ def estimate_acf_ar(
         Half-width of the template window.
     ar_order : int
         Order of the AR model to fit (default 3).
+    max_lag : int | None
+        Largest returned lag, defaulting to ``4 * half_win``. Only the
+        continuation length changes; baseline samples and fitted AR parameters
+        do not depend on this value.
 
     Returns
     -------
     NDArray
-        Autocorrelation function ``R(k)`` for ``k = 0, ..., 4 * half_win``.
+        Autocovariance ``R(k)`` through *max_lag*. If no baseline is available,
+        the existing white-noise fallback returns only the zero-lag variance.
     """
+    output_max_lag = _resolve_acf_max_lag(half_win, max_lag)
+
     if data.ndim == 1:
         data = data.reshape(-1, 1)
 
@@ -701,15 +585,15 @@ def estimate_acf_ar(
     if not segments:
         return np.array([np.mean(np.var(data, axis=0))])
 
-    # Pool autocorrelation estimates across segments and channels
-    max_lag = 4 * half_win
-    r = np.zeros(max_lag + 1)
+    # Keep the fitted moments independent of the requested continuation length.
+    fit_max_lag = 4 * half_win
+    r = np.zeros(fit_max_lag + 1)
     count = 0
     for seg in segments:
         for ch in range(seg.shape[1]):
             x = seg[:, ch] - seg[:, ch].mean()
             n = len(x)
-            for k in range(min(n, max_lag + 1)):
+            for k in range(min(n, fit_max_lag + 1)):
                 r[k] += np.sum(x[: n - k] * x[k:n])
             count += n
 
@@ -721,7 +605,7 @@ def estimate_acf_ar(
     # Fit AR(p) via Yule-Walker
     p = min(ar_order, len(r) - 1)
     if p < 1 or r[0] < 1e-30:
-        acf = np.zeros(max_lag + 1)
+        acf = np.zeros(output_max_lag + 1)
         acf[0] = r[0]
         return acf
 
@@ -735,7 +619,7 @@ def estimate_acf_ar(
     try:
         ar_coeffs = np.linalg.solve(R_mat, r_vec)
     except np.linalg.LinAlgError:
-        acf = np.zeros(max_lag + 1)
+        acf = np.zeros(output_max_lag + 1)
         acf[0] = r[0]
         return acf
 
@@ -744,12 +628,23 @@ def estimate_acf_ar(
     sigma2_e = max(sigma2_e, 1e-30)
 
     # Generate ACF from AR model: R(k) = sum_i phi_i R(k-i) for k > p
-    acf = np.zeros(max_lag + 1)
-    acf[: min(p + 1, max_lag + 1)] = r[: min(p + 1, max_lag + 1)]
-    for k in range(p + 1, max_lag + 1):
+    acf = np.zeros(output_max_lag + 1)
+    acf[: min(p + 1, output_max_lag + 1)] = r[: min(p + 1, output_max_lag + 1)]
+    for k in range(p + 1, output_max_lag + 1):
         acf[k] = sum(ar_coeffs[i] * acf[k - 1 - i] for i in range(p))
 
     return acf
+
+
+def _event_block_labels(ix: NDArray, event_blocks: NDArray | None) -> NDArray:
+    if event_blocks is None:
+        return np.zeros(len(ix), dtype=int)
+    blocks = np.asarray(event_blocks)
+    if blocks.shape != np.shape(ix):
+        raise ValueError(
+            f"event_blocks must have the shape of ix {np.shape(ix)}, got {blocks.shape}"
+        )
+    return blocks
 
 
 def build_DtSigmaD_acf(
@@ -759,10 +654,14 @@ def build_DtSigmaD_acf(
     half_win: int,
     acf: NDArray,
     data_length: int | None = None,
+    event_blocks: NDArray | None = None,
 ) -> NDArray:
     """Build D^T Sigma_W D from a general autocorrelation function.
 
     ``acf[k] = R(k)``, the noise autocovariance at lag *k*.
+    Lags beyond the supplied array are treated as zero. For an AR model,
+    supply all lags required by the event windows. A shorter array is exact
+    only when its omitted covariance is zero, as for a finite-support model.
 
     Parameters
     ----------
@@ -777,8 +676,12 @@ def build_DtSigmaD_acf(
     acf : NDArray
         Autocorrelation function of shape ``(max_lag + 1,)``.
     data_length : int | None
-        Total length of the data array.  Used to exclude events too close to
-        the boundary.
+        Total length of the data array. Excludes events whose windows extend
+        past the end; windows ending exactly at this length are included.
+    event_blocks : NDArray | None
+        Recording-block label of each event in *ix*. Event pairs from
+        different blocks contribute no covariance. *None* treats all events
+        as one block.
 
     Returns
     -------
@@ -788,6 +691,7 @@ def build_DtSigmaD_acf(
     M = len(events)
     T = 2 * half_win
     p = M * T
+    blocks = _event_block_labels(ix, event_blocks)
 
     max_lag = len(acf) - 1
     offsets = np.arange(T)[:, None] - np.arange(T)[None, :]
@@ -797,16 +701,17 @@ def build_DtSigmaD_acf(
     for ii, ev_i in enumerate(events):
         sel_i = lb == ev_i
         if data_length is not None:
-            sel_i = sel_i & (ix < data_length - half_win)
+            sel_i = sel_i & (ix <= data_length - half_win)
         ix_i = ix[sel_i]
         for jj, ev_j in enumerate(events):
             sel_j = lb == ev_j
             if data_length is not None:
-                sel_j = sel_j & (ix < data_length - half_win)
+                sel_j = sel_j & (ix <= data_length - half_win)
             ix_j = ix[sel_j]
+            blocks_j = blocks[sel_j]
             block = np.zeros((T, T))
-            for ti in ix_i:
-                for tj in ix_j:
+            for ti, block_i in zip(ix_i, blocks[sel_i]):
+                for tj in ix_j[blocks_j == block_i]:
                     dt_base = ti - tj
                     abs_lags = np.abs(dt_base + offsets)
                     valid = abs_lags <= max_lag
@@ -817,6 +722,21 @@ def build_DtSigmaD_acf(
     return DtSigmaD
 
 
+def _required_covariance_lag(
+    ix: NDArray,
+    lb: NDArray,
+    events: NDArray,
+    half_win: int,
+    data_length: int,
+) -> int:
+    """Largest lag for retained event pairs, assuming complete left windows."""
+    selected = np.isin(lb, events) & (ix <= data_length - half_win)
+    times = ix[selected]
+    if times.size == 0:
+        return 0
+    return int(times.max() - times.min()) + 2 * half_win - 1
+
+
 def build_DtSigmaD_ar1(
     ix: NDArray,
     lb: NDArray,
@@ -825,6 +745,7 @@ def build_DtSigmaD_ar1(
     phi: float,
     sigsq: float,
     data_length: int | None = None,
+    event_blocks: NDArray | None = None,
 ) -> NDArray:
     """Build D^T Sigma_W D for AR(1) noise: ``(Sigma_W)_ij = sigsq * phi^|i-j|``.
 
@@ -851,11 +772,17 @@ def build_DtSigmaD_ar1(
     half_win : int
         Half-width of the template window.
     phi : float
-        AR(1) coefficient.
+        Stationary AR(1) coefficient, including negative values (``abs(phi) < 1``).
     sigsq : float
-        Noise variance (innovation variance scaled by AR process).
+        Marginal noise variance, equal to innovation variance divided by
+        ``1 - phi**2``.
     data_length : int | None
-        Total data length; used to exclude boundary events.
+        Total data length. Excludes events whose windows extend past the end;
+        windows ending exactly at this length are included.
+    event_blocks : NDArray | None
+        Recording-block label of each event in *ix*. Event pairs from
+        different blocks contribute no covariance. *None* treats all events
+        as one block.
 
     Returns
     -------
@@ -865,130 +792,36 @@ def build_DtSigmaD_ar1(
     M = len(events)
     T = 2 * half_win
     p = M * T
+    blocks = _event_block_labels(ix, event_blocks)
 
-    # Precompute phi^k lookup table
-    max_lag = 4 * T
-    phi_table = sigsq * np.power(abs(phi), np.arange(max_lag + 1))
-
-    # Template offset grid: a - b for all (a, b) pairs
-    offsets = np.arange(T)[:, None] - np.arange(T)[None, :]  # T x T
+    # Each event-pair block has only 2*T-1 distinct lags. Evaluate these
+    # directly without a tail cutoff or a lookup table spanning the recording.
+    # Negative phi retains its alternating-sign correlations.
+    lag_offsets = np.arange(1 - T, T)
+    offset_indices = np.arange(T)[:, None] - np.arange(T)[None, :] + T - 1
 
     DtSigmaD = np.zeros((p, p))
 
     for ii, ev_i in enumerate(events):
         sel_i = lb == ev_i
         if data_length is not None:
-            sel_i = sel_i & (ix < data_length - half_win)
+            sel_i = sel_i & (ix <= data_length - half_win)
         ix_i = ix[sel_i]
         for jj, ev_j in enumerate(events):
             sel_j = lb == ev_j
             if data_length is not None:
-                sel_j = sel_j & (ix < data_length - half_win)
+                sel_j = sel_j & (ix <= data_length - half_win)
             ix_j = ix[sel_j]
+            blocks_j = blocks[sel_j]
             block = np.zeros((T, T))
-            for ti in ix_i:
-                for tj in ix_j:
+            for ti, block_i in zip(ix_i, blocks[sel_i]):
+                for tj in ix_j[blocks_j == block_i]:
                     dt_base = ti - tj
-                    abs_lags = np.abs(dt_base + offsets)
-                    valid = abs_lags <= max_lag
-                    contrib = np.where(
-                        valid, phi_table[np.minimum(abs_lags, max_lag)], 0.0
-                    )
-                    block += contrib
+                    correlations = sigsq * np.power(phi, np.abs(dt_base + lag_offsets))
+                    block += correlations[offset_indices]
             DtSigmaD[ii * T : (ii + 1) * T, jj * T : (jj + 1) * T] = block
 
     return DtSigmaD
-
-
-def SURE_cost(
-    regval: float,
-    DtD: NDArray,
-    D: NDArray,
-    Dpinv: NDArray,
-    DpinvX: NDArray,
-    S: NDArray,
-    theta_ml: NDArray,
-    X: NDArray,
-    sigsq: float,
-    reg_l2: float | None,
-    l2_mat: NDArray,
-    omega: float = 0.5,
-) -> float:
-    """Compute the full (non-fast) SURE cost for a given regularization value.
-
-    Parameters
-    ----------
-    regval : float
-        Regularization parameter (lambda).
-    DtD : NDArray
-        Gram matrix ``D^T D`` of shape ``(p, p)``.
-    D : NDArray
-        Design matrix of shape ``(n, p)``.
-    Dpinv : NDArray
-        Pseudoinverse of the design matrix of shape ``(p, n)``.
-    DpinvX : NDArray
-        ``D^+ X`` of shape ``(p, C)``.
-    S : NDArray
-        Penalty matrix of shape ``(p, p)``.
-    theta_ml : NDArray
-        ML (OLS) estimate of shape ``(p, C)``.
-    X : NDArray
-        Data matrix of shape ``(n, C)``.
-    sigsq : float
-        Noise variance estimate.
-    reg_l2 : float | None
-        L2-mixing coefficient.  When *None*, pure Tikhonov is used.
-    l2_mat : NDArray
-        L2 penalty matrix of shape ``(p, p)``.
-    omega : float
-        SURE weighting parameter (default 0.5).
-
-    Returns
-    -------
-    float
-        Scalar SURE cost.
-    """
-    if reg_l2 is None:
-        G = calc_G(DtD, regval, S, D)
-    else:
-        G = calc_G((1 - reg_l2) * (DtD) + reg_l2 * l2_mat, regval, S, D)
-
-    Gx = calc_Gx(G, X)
-    trace_term = calc_trace_term(G, Dpinv, sigsq)
-    norm_vec = calc_normvec(Gx, trace_term, omega, G, sigsq)
-    cost = calc_cost(norm_vec, X, G, DpinvX, omega)
-
-    return cost
-
-
-def gen_tempmat(vec: NDArray, TT: int, M: int) -> NDArray:
-    """Generate the block-diagonal penalty matrix from a convolution kernel.
-
-    Builds ``R R^T`` from the convolution matrix of *vec* and replicates it
-    *M* times in a block-diagonal structure.
-
-    Parameters
-    ----------
-    vec : NDArray
-        1-D convolution kernel.
-    TT : int
-        Total number of template parameters (``M * T``).
-    M : int
-        Number of event types.
-
-    Returns
-    -------
-    NDArray
-        Block-diagonal penalty matrix of shape ``(TT, TT)``.
-    """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
-
-    L = len(vec)
-    T = int(TT / M)
-    R = sp.linalg.convolution_matrix(vec, T - (L - 1))
-    RR = R @ R.T
-    return sp.linalg.block_diag(*([RR] * M))
 
 
 def gen_corefilt(vec: NDArray, symm: bool) -> NDArray:
@@ -1018,94 +851,83 @@ def gen_corefilt(vec: NDArray, symm: bool) -> NDArray:
     return out
 
 
-def SURE_cost_vec(
-    vec: NDArray,
-    DtD: NDArray,
-    theta_ml: NDArray,
-    X: NDArray,
-    sigsq: float,
-    M: int,
-    symm: bool = False,
-    omega: float = 0.5,
-    _cost_scale: float | None = None,
-    DtSigmaD: NDArray | None = None,
-) -> float:
-    """SURE cost as a function of the convolution-kernel vector.
+class _KernelSUREObjective:
+    """Evaluate the existing kernel SURE objective and its gradient.
 
-    Builds the penalty matrix from *vec* via :func:`gen_tempmat` and evaluates
-    the SURE cost at ``lambda = 1``.  Supports both white-noise and
-    colored-noise variants.
-
-    Parameters
-    ----------
-    vec : NDArray
-        1-D convolution kernel parameters to optimise.
-    DtD : NDArray
-        Gram matrix ``D^T D`` of shape ``(p, p)``.
-    theta_ml : NDArray
-        ML (OLS) estimate of shape ``(p, C)``.
-    X : NDArray
-        Data matrix of shape ``(n, C)``.
-    sigsq : float
-        Noise variance estimate.
-    M : int
-        Number of event types.
-    symm : bool
-        Whether to symmetrise the kernel (default *False*).
-    omega : float
-        SURE weighting parameter (default 0.5).
-    _cost_scale : float | None
-        When provided, the cost is divided by this value (for numerical
-        scaling during optimisation).
-    DtSigmaD : NDArray | None
-        ``D^T Sigma_W D`` for the colored-noise SURE variant.  When *None*,
-        the white-noise variant is used.
-
-    Returns
-    -------
-    float
-        Scalar SURE cost (optionally rescaled).
+    At lambda=1 the generalized spectral weights are all one, so the
+    objective can use P = inverse(DtD + S) through Cholesky solves. The
+    covariance and omega correction retain the scalar objective's behavior.
+    No diagonal jitter or fallback is applied to invalid matrices.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
 
-    S = gen_tempmat(gen_corefilt(vec, symm), DtD.shape[0], M)
+    def __init__(
+        self,
+        DtD: NDArray,
+        theta_ml: NDArray,
+        X: NDArray,
+        sigsq: float,
+        M: int,
+        symm: bool = False,
+        omega: float = 0.5,
+        _cost_scale: float | None = None,
+        DtSigmaD: NDArray | None = None,
+    ) -> None:
+        design_gram = np.asarray(DtD)
+        ml_templates = np.asarray(theta_ml)
+        self.DtD = design_gram
+        self.theta_ml = ml_templates
+        self.DtX = design_gram @ ml_templates
+        self.M = M
+        self.T = design_gram.shape[0] // M
+        self.symm = symm
+        self.omega = omega
+        self.cost_scale = 1.0 if _cost_scale is None else _cost_scale
+        self.identity = np.eye(design_gram.shape[0])
+        n_cols = X.shape[1] if X.ndim > 1 else 1
 
-    DtD_arr = np.asarray(DtD)
-    S_arr = np.asarray(S)
-    theta_ml_arr = np.asarray(theta_ml)
+        if DtSigmaD is None:
+            trace_matrix = sigsq * self.identity
+            correction_variance = sigsq
+        else:
+            # Only the symmetric part contributes to trace(P @ trace_matrix).
+            trace_matrix = np.linalg.solve(self.DtD, np.asarray(DtSigmaD)).T
+            trace_matrix = (trace_matrix + trace_matrix.T) / 2
+            correction_variance = np.trace(DtSigmaD) / self.DtD.shape[0]
+        self.Q = 2 * omega * n_cols * trace_matrix
+        if abs(omega - 0.5) > 1e-5:
+            self.Q -= (2 * omega - 1) * n_cols * correction_variance * self.identity
 
-    mu, V = sp.linalg.eigh(DtD_arr, DtD_arr + S_arr)
-    mu = np.clip(mu, 0, 1)
-
-    DtX = DtD_arr @ theta_ml_arr
-    DtX_rot = V.T @ DtX
-
-    n_obs = X.shape[0]
-    n_cols = X.shape[1] if X.ndim > 1 else 1
-
-    if DtSigmaD is not None:
-        precomp = precompute_colored_trace(DtD_arr, DtSigmaD, V, mu)
-        cost = SURE_cost_colored(
-            1.0,
-            mu,
-            DtX_rot,
-            V,
-            theta_ml_arr,
-            DtSigmaD,
-            n_obs,
-            n_cols,
-            omega,
-            _precomp=precomp,
+    def value_gradient(self, vec: NDArray) -> tuple[float, NDArray]:
+        """Return the scaled cost and derivatives in independent kernel entries."""
+        kernel = gen_corefilt(vec, self.symm)
+        R = sp.linalg.convolution_matrix(kernel, self.T - len(kernel) + 1)
+        S = sp.linalg.block_diag(*([R @ R.T] * self.M))
+        factor = sp.linalg.cho_factor(self.DtD + S, lower=True)
+        P = sp.linalg.cho_solve(factor, self.identity)
+        Phi = sp.linalg.cho_solve(factor, self.DtX)
+        cost = (
+            self.omega * np.sum(Phi**2)
+            - 2 * self.omega * np.sum(self.theta_ml * Phi)
+            + np.sum(P * self.Q.T)
         )
-    else:
-        cost = SURE_cost_fast(
-            1.0, mu, DtX_rot, V, theta_ml_arr, sigsq, n_obs, n_cols, omega
-        )
 
-    if _cost_scale is not None:
-        return cost / _cost_scale
-    return cost
+        # dPhi = -P @ dS @ Phi. Differentiate the trace term as well.
+        Z = P @ (Phi - self.theta_ml)
+        grad_S = -self.omega * (Z @ Phi.T + Phi @ Z.T) - P @ self.Q @ P
+        block = sum(
+            grad_S[j * self.T : (j + 1) * self.T, j * self.T : (j + 1) * self.T]
+            for j in range(self.M)
+        )
+        grad_R = block @ R
+        gradient = np.empty(len(vec))
+        for k in range(len(vec)):
+            basis = np.zeros(len(vec))
+            basis[k] = 1.0
+            dR = sp.linalg.convolution_matrix(
+                gen_corefilt(basis, self.symm), self.T - len(kernel) + 1
+            )
+            gradient[k] = 2 * np.sum(grad_R * dR)
+        return float(cost / self.cost_scale), gradient / self.cost_scale
 
 
 # --- Noise estimation ---
@@ -1130,8 +952,6 @@ def calc_vrf(
         ``(numerator, denominator, vrf)`` -- the filter coefficients and the
         variance reduction factor.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy.signal as sig
 
     b, a = sig.butter(order, wn, btype="highpass")
     bt = sig.dlti(b, a)
@@ -1158,8 +978,6 @@ def hpf(x: NDArray, wn: float, order: int) -> tuple[NDArray, float]:
         ``(filtered_data, vrf)`` -- the filtered data of shape ``(T, C)``
         and the variance reduction factor.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy.signal as sig
 
     b, a, vrf = calc_vrf(order, wn)
     zi = sig.lfilter_zi(b, a)
@@ -1197,111 +1015,6 @@ def est_noise_var_hpf(data: NDArray) -> float:
     M, vrf = hpf(data, 0.6, 4)
     var_vec = np.var(M, axis=0) / vrf
     return np.mean(var_vec)
-
-
-def est_noise_var_gcv(
-    DtD: NDArray | scipy.sparse.spmatrix,
-    DtX: NDArray | scipy.sparse.spmatrix,
-    S: NDArray | scipy.sparse.spmatrix,
-    X: NDArray,
-    D: NDArray | scipy.sparse.spmatrix,
-) -> float:
-    """Estimate noise variance from residuals of a GCV-regularized fit.
-
-    Uses corrected eigendecomposition (V is B-orthonormal, not orthonormal).
-
-    Parameters
-    ----------
-    DtD : NDArray | scipy.sparse.spmatrix
-        Gram matrix ``D^T D`` of shape ``(p, p)``.
-    DtX : NDArray | scipy.sparse.spmatrix
-        Cross-product ``D^T X`` of shape ``(p, C)``.
-    S : NDArray | scipy.sparse.spmatrix
-        Penalty matrix of shape ``(p, p)``.
-    X : NDArray
-        Data matrix of shape ``(n, C)``.
-    D : NDArray | scipy.sparse.spmatrix
-        Design matrix of shape ``(n, p)``.
-
-    Returns
-    -------
-    float
-        Estimated noise variance.
-    """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
-
-    DtD_dense = np.asarray(
-        DtD.todense() if sp.sparse.issparse(DtD) else DtD, dtype=float
-    )
-    S_dense = np.asarray(S.todense() if sp.sparse.issparse(S) else S, dtype=float)
-    DtX_dense = np.asarray(
-        DtX.todense() if sp.sparse.issparse(DtX) else DtX, dtype=float
-    )
-
-    n_obs = X.shape[0]
-    n_cols = X.shape[1] if X.ndim > 1 else 1
-    XtX_sum = np.sum(X**2)
-
-    mu, V = sp.linalg.eigh(DtD_dense, DtD_dense + S_dense)
-    mu = np.clip(mu, 0, 1)
-    DtX_rot = V.T @ DtX_dense
-
-    lambdas = np.logspace(-3, 5, 80)
-    best_lam, best_score = lambdas[0], np.inf
-    for lam in lambdas:
-        g = 1.0 / (mu + lam * (1 - mu) + 1e-30)
-        trace_H = np.sum(mu * g)
-        denom = n_obs - trace_H
-        if denom <= 0:
-            continue
-        Phi_hat = V @ (g[:, None] * DtX_rot)
-        cross = np.sum(DtX_dense * Phi_hat)
-        quad = np.sum(Phi_hat * (DtD_dense @ Phi_hat))
-        residual_ss = XtX_sum - 2 * cross + quad
-        score = residual_ss / (denom**2) * n_obs
-        if score < best_score:
-            best_score = score
-            best_lam = lam
-
-    g = 1.0 / (mu + best_lam * (1 - mu) + 1e-30)
-    gamma = np.sum(mu * g)
-    Phi_hat = V @ (g[:, None] * DtX_rot)
-    cross = np.sum(DtX_dense * Phi_hat)
-    quad = np.sum(Phi_hat * (DtD_dense @ Phi_hat))
-    residual_ss = XtX_sum - 2 * cross + quad
-    dof = n_obs * n_cols - gamma
-    sigsq = residual_ss / max(dof, 1.0)
-
-    return sigsq
-
-
-def est_noise_var_mad(data: NDArray) -> float:
-    """Estimate noise variance via MAD of finest Haar wavelet coefficients.
-
-    Computes ``sigma = median(|d_finest|) / 0.6745`` where *d_finest* are the
-    detail coefficients at the finest scale of a Haar wavelet decomposition.
-
-    Parameters
-    ----------
-    data : NDArray
-        Input signal of shape ``(T,)`` or ``(T, C)``.
-
-    Returns
-    -------
-    float
-        Scalar noise variance estimate averaged across channels.
-    """
-    n_samples = data.shape[0]
-    if data.ndim == 1:
-        data = data.reshape(-1, 1)
-
-    # Haar wavelet: finest detail coefficients = (x[2k] - x[2k+1]) / sqrt(2)
-    n_pairs = n_samples // 2
-    details = (data[: 2 * n_pairs : 2] - data[1 : 2 * n_pairs : 2]) / np.sqrt(2)
-
-    mad_per_ch = np.median(np.abs(details), axis=0) / 0.6745
-    return np.mean(mad_per_ch**2)
 
 
 def est_noise_var_pairwise(
@@ -1402,169 +1115,6 @@ def est_noise_var_baseline(
     return np.mean(var_per_epoch)
 
 
-def est_noise_var_outofband(
-    data_raw: NDArray,
-    bandpass: tuple[float, float],
-    fs: float,
-    noise_band: tuple[float, float] | None = None,
-) -> float:
-    """Estimate noise variance from a frequency band with minimal signal content.
-
-    Assumes the noise has a flat PSD (broadband).  Estimates the noise PSD from
-    a band where the signal is negligible, then scales to the full working
-    bandwidth.
-
-    Parameters
-    ----------
-    data_raw : NDArray
-        Data of shape ``(T, C)`` containing the noise band (raw or bandpassed).
-    bandpass : tuple[float, float]
-        Working signal band ``(low_hz, high_hz)``.
-    fs : float
-        Sampling frequency in Hz.
-    noise_band : tuple[float, float] | None
-        Frequency band ``(lo_hz, hi_hz)`` to estimate noise from.  Should be a
-        region with minimal signal content.  If *None*, defaults to
-        ``(high_hz * 1.2, Nyquist)``.
-
-    Returns
-    -------
-    float
-        Estimated in-band noise variance.
-    """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy.signal as sig
-
-    nyq = fs / 2.0
-    low_hz, high_hz = bandpass
-
-    if noise_band is None:
-        noise_lo = high_hz * 1.2
-        noise_hi = nyq * 0.95
-        if noise_lo >= noise_hi:
-            noise_lo = high_hz * 0.9
-            noise_hi = min(high_hz, nyq * 0.95)
-    else:
-        noise_lo, noise_hi = noise_band
-
-    if data_raw.ndim == 1:
-        data_raw = data_raw.reshape(-1, 1)
-
-    # Bandpass filter to isolate the noise estimation band
-    bp_lo = noise_lo / nyq
-    bp_hi = min(noise_hi / nyq, 0.99)
-
-    sos = sig.butter(4, [bp_lo, bp_hi], btype="band", output="sos")
-    filtered = sig.sosfiltfilt(sos, data_raw, axis=0)
-
-    # Variance of filtered signal = noise PSD * noise_bandwidth
-    var_filtered = np.mean(np.var(filtered, axis=0))
-
-    # Noise PSD estimate (assuming flat)
-    noise_bw = noise_hi - noise_lo
-    sigma2_per_hz = var_filtered / noise_bw
-
-    # Scale to the working signal band
-    signal_bw = high_hz - low_hz
-    sigma2_inband = sigma2_per_hz * signal_bw
-
-    return sigma2_inband
-
-
-def est_noise_var_ar1_corrected(
-    data: NDArray,
-    ix: NDArray,
-    half_win: int,
-    base_method: str = "baseline",
-    lb: NDArray | None = None,
-    **kwargs: object,
-) -> float:
-    """Compute AR(1)-corrected noise variance for temporally correlated noise.
-
-    Estimates the lag-1 autocorrelation *phi* from pre-stimulus baselines, then
-    scales the base noise estimate by ``(1 + phi) / (1 - phi)`` to account for
-    the effective degrees of freedom with correlated noise.
-
-    Parameters
-    ----------
-    data : NDArray
-        Continuous data of shape ``(T,)`` or ``(T, C)``.
-    ix : NDArray
-        1-D integer array of event-onset indices.
-    half_win : int
-        Half-width of the template window.
-    base_method : str
-        Base noise estimation method (``'baseline'``, ``'pairwise'``,
-        ``'mad'``, or ``'hpf'``).
-    lb : NDArray | None
-        Event labels, required when *base_method* is ``'pairwise'``.
-    **kwargs : object
-        Additional keyword arguments (unused, kept for API compatibility).
-
-    Returns
-    -------
-    float
-        Corrected noise variance estimate.
-    """
-    if base_method == "baseline":
-        sigma2_base = est_noise_var_baseline(data, ix, half_win)
-    elif base_method == "pairwise":
-        if lb is None:
-            raise ValueError("pairwise noise estimation requires lb")
-        sigma2_base = est_noise_var_pairwise(data, ix, lb, half_win)
-    elif base_method == "mad":
-        sigma2_base = est_noise_var_mad(data)
-    else:
-        sigma2_base = est_noise_var_hpf(data)
-
-    if data.ndim == 1:
-        data = data.reshape(-1, 1)
-
-    n_baseline = max(1, int(2 * half_win * 0.3))
-    phi_estimates = []
-    for idx in ix:
-        start = idx - half_win
-        end = start + n_baseline
-        if start < 0 or end > len(data):
-            continue
-        segment = data[start:end]
-        for ch in range(segment.shape[1]):
-            x = segment[:, ch]
-            if len(x) < 4:
-                continue
-            x = x - x.mean()
-            r0 = np.mean(x**2)
-            if r0 < 1e-30:
-                continue
-            r1 = np.mean(x[:-1] * x[1:])
-            phi_estimates.append(r1 / r0)
-
-    if not phi_estimates:
-        return sigma2_base
-
-    phi = np.median(phi_estimates)
-    phi = np.clip(phi, -0.99, 0.99)
-
-    correction = (1 + phi) / (1 - phi)
-    correction = max(correction, 1.0)
-
-    return sigma2_base * correction
-
-
-def _est_noise_ar1(
-    data: NDArray,
-    ix: NDArray | None,
-    lb: NDArray | None,
-    half_win: int | None,
-    **_kwargs: object,
-) -> float:
-    if ix is None:
-        raise ValueError("AR1 noise estimation requires ix (got None)")
-    if half_win is None:
-        raise ValueError("AR1 noise estimation requires half_win (got None)")
-    return est_noise_var_ar1_corrected(data, ix, half_win, lb=lb)
-
-
 def _est_noise_colored(
     data: NDArray,
     ix: NDArray | None,
@@ -1577,23 +1127,6 @@ def _est_noise_colored(
     if half_win is None:
         raise ValueError(f"{method} noise estimation requires half_win (got None)")
     return est_noise_var_baseline(data, ix, half_win)
-
-
-def _est_noise_outofband(
-    data: NDArray,
-    data_raw: NDArray | None,
-    bandpass: tuple[float, float] | None,
-    fs: float | None,
-    noise_band: tuple[float, float] | None,
-    **_kwargs: object,
-) -> float:
-    if data_raw is None:
-        raise ValueError("Out-of-band noise estimation requires data_raw (got None)")
-    if bandpass is None:
-        raise ValueError("Out-of-band noise estimation requires bandpass (got None)")
-    if fs is None:
-        raise ValueError("Out-of-band noise estimation requires fs (got None)")
-    return est_noise_var_outofband(data_raw, bandpass, fs, noise_band=noise_band)
 
 
 def _est_noise_pairwise(
@@ -1625,73 +1158,16 @@ def _est_noise_baseline(
     return est_noise_var_baseline(data, ix, half_win)
 
 
-def _est_noise_gcv(
-    data: NDArray,
-    DtD: NDArray | scipy.sparse.spmatrix | None,
-    DtX: NDArray | scipy.sparse.spmatrix | None,
-    S: NDArray | scipy.sparse.spmatrix | None,
-    X: NDArray | None,
-    D: NDArray | scipy.sparse.spmatrix | None,
-    **_kwargs: object,
-) -> float:
-    if DtD is None:
-        raise ValueError("GCV noise estimation requires DtD (got None)")
-    if DtX is None:
-        raise ValueError("GCV noise estimation requires DtX (got None)")
-    if S is None:
-        raise ValueError("GCV noise estimation requires S (got None)")
-    if X is None:
-        raise ValueError("GCV noise estimation requires X (got None)")
-    if D is None:
-        raise ValueError("GCV noise estimation requires D (got None)")
-    return est_noise_var_gcv(DtD, DtX, S, X, D)
-
-
-def _est_noise_empbayes_residual(
-    data: NDArray,
-    DtD: NDArray | scipy.sparse.spmatrix | None,
-    DtX: NDArray | scipy.sparse.spmatrix | None,
-    S: NDArray | scipy.sparse.spmatrix | None,
-    X: NDArray | None,
-    D: NDArray | scipy.sparse.spmatrix | None,
-    ix: NDArray | None,
-    lb: NDArray | None,
-    half_win: int | None,
-    **_kwargs: object,
-) -> float:
-    if DtD is None:
-        raise ValueError("empbayes_residual requires DtD (got None)")
-    if DtX is None:
-        raise ValueError("empbayes_residual requires DtX (got None)")
-    if S is None:
-        raise ValueError("empbayes_residual requires S (got None)")
-    if X is None:
-        raise ValueError("empbayes_residual requires X (got None)")
-    if D is None:
-        raise ValueError("empbayes_residual requires D (got None)")
-    return est_noise_var_empbayes_residual(
-        DtD, DtX, S, X, D, ix=ix, lb=lb, half_win=half_win
-    )
-
-
-def _est_noise_mad(data: NDArray, **_kwargs: object) -> float:
-    return est_noise_var_mad(data)
-
-
 def _est_noise_hpf(data: NDArray, **_kwargs: object) -> float:
     return est_noise_var_hpf(data)
 
 
+# pyre-ignore[3]: return type intentionally broad for dispatch dict
 _NOISE_ESTIMATORS: dict[str, object] = {
-    "ar1": _est_noise_ar1,
     "ar1_colored": _est_noise_colored,
     "ar3_colored": _est_noise_colored,
-    "outofband": _est_noise_outofband,
     "pairwise": _est_noise_pairwise,
     "baseline": _est_noise_baseline,
-    "gcv": _est_noise_gcv,
-    "empbayes_residual": _est_noise_empbayes_residual,
-    "mad": _est_noise_mad,
     "hpf": _est_noise_hpf,
 }
 
@@ -1699,18 +1175,9 @@ _NOISE_ESTIMATORS: dict[str, object] = {
 def est_noise_var(
     data: NDArray,
     method: str = "pairwise",
-    DtD: NDArray | scipy.sparse.spmatrix | None = None,
-    DtX: NDArray | scipy.sparse.spmatrix | None = None,
-    S: NDArray | scipy.sparse.spmatrix | None = None,
-    X: NDArray | None = None,
-    D: NDArray | scipy.sparse.spmatrix | None = None,
     ix: NDArray | None = None,
     lb: NDArray | None = None,
     half_win: int | None = None,
-    data_raw: NDArray | None = None,
-    bandpass: tuple[float, float] | None = None,
-    fs: float | None = None,
-    noise_band: tuple[float, float] | None = None,
 ) -> float:
     """Estimate noise variance with a configurable method.
 
@@ -1719,37 +1186,16 @@ def est_noise_var(
     data : NDArray
         Continuous data of shape ``(T, C)``.
     method : str
-        Noise estimation method.  One of ``'outofband'``, ``'pairwise'``,
-        ``'baseline'``, ``'ar1'``, ``'ar1_colored'``, ``'ar3_colored'``,
-        ``'gcv'``, ``'empbayes_residual'``, ``'hpf'``, or ``'mad'``.
-    DtD : NDArray | scipy.sparse.spmatrix | None
-        Gram matrix ``D^T D``.  Required for ``'gcv'`` and
-        ``'empbayes_residual'``.
-    DtX : NDArray | scipy.sparse.spmatrix | None
-        Cross-product ``D^T X``.  Required for ``'gcv'`` and
-        ``'empbayes_residual'``.
-    S : NDArray | scipy.sparse.spmatrix | None
-        Penalty matrix.  Required for ``'gcv'`` and ``'empbayes_residual'``.
-    X : NDArray | None
-        Data matrix.  Required for ``'gcv'`` and ``'empbayes_residual'``.
-    D : NDArray | scipy.sparse.spmatrix | None
-        Design matrix.  Required for ``'gcv'`` and ``'empbayes_residual'``.
+        Noise estimation method.  One of ``'pairwise'``, ``'baseline'``,
+        ``'ar1_colored'``, ``'ar3_colored'``, or ``'hpf'``.
     ix : NDArray | None
         Event-onset indices.  Required for ``'pairwise'``, ``'baseline'``,
-        ``'ar1'``, and colored variants.
+        and colored variants.
     lb : NDArray | None
         Event labels.  Required for ``'pairwise'``.
     half_win : int | None
         Half-width of the template window.  Required for ``'pairwise'``,
-        ``'baseline'``, ``'ar1'``, and colored variants.
-    data_raw : NDArray | None
-        Raw data for out-of-band estimation.
-    bandpass : tuple[float, float] | None
-        Working signal band ``(low_hz, high_hz)`` for ``'outofband'``.
-    fs : float | None
-        Sampling frequency in Hz for ``'outofband'``.
-    noise_band : tuple[float, float] | None
-        Noise estimation band for ``'outofband'``.
+        ``'baseline'``, and colored variants.
 
     Returns
     -------
@@ -1759,139 +1205,136 @@ def est_noise_var(
     estimator = _NOISE_ESTIMATORS.get(method)
     if estimator is None:
         raise ValueError(f"Unknown noise estimation method: {method}")
+    # pyre-ignore[29]: dispatch dict callable
     return estimator(
         data=data,
         method=method,
-        DtD=DtD,
-        DtX=DtX,
-        S=S,
-        X=X,
-        D=D,
         ix=ix,
         lb=lb,
         half_win=half_win,
-        data_raw=data_raw,
-        bandpass=bandpass,
-        fs=fs,
-        noise_band=noise_band,
     )
 
 
-def est_noise_var_empbayes_residual(
-    DtD: NDArray | scipy.sparse.spmatrix,
-    DtX: NDArray | scipy.sparse.spmatrix,
-    S: NDArray | scipy.sparse.spmatrix,
-    X: NDArray,
-    D: NDArray | scipy.sparse.spmatrix,
-    ix: NDArray | None = None,
-    lb: NDArray | None = None,
-    half_win: int | None = None,
-) -> float:
-    """Estimate effective noise variance via EB-regularized epoch residuals.
+# --- Stable regularization path for design-scaled lambda searches ---
+# Scalar SURE and the L-curve search six decades beyond the penalty's
+# transition scales, where direct solves of D^T D + lam S lose accuracy.
 
-    Two-stage approach:
 
-    1. Run MacKay's EB to get optimal lambda (no sigma-squared needed).
-    2. Compute epoch-level residuals and estimate sigma-squared from those.
+def _dense(matrix: NDArray | scipy.sparse.spmatrix) -> NDArray:
+    return np.asarray(
+        matrix.todense() if sp.sparse.issparse(matrix) else matrix, dtype=float
+    )
 
-    Using epoch-level residuals (not full-signal) avoids dilution by the
-    vast majority of samples where no events occur.
 
-    Parameters
-    ----------
-    DtD : NDArray | scipy.sparse.spmatrix
-        Gram matrix ``D^T D`` of shape ``(p, p)``.
-    DtX : NDArray | scipy.sparse.spmatrix
-        Cross-product ``D^T X`` of shape ``(p, C)``.
-    S : NDArray | scipy.sparse.spmatrix
-        Penalty matrix of shape ``(p, p)``.
-    X : NDArray
-        Data matrix of shape ``(n, C)``.
-    D : NDArray | scipy.sparse.spmatrix
-        Design matrix of shape ``(n, p)``.
-    ix : NDArray | None
-        Event-onset indices for epoch-level residual computation.
-    lb : NDArray | None
-        Event labels corresponding to *ix*.
-    half_win : int | None
-        Half-width of the template window.
+def _relative_change(change: float, scale: float) -> float:
+    """Return change / scale; with a zero scale only an exact zero passes."""
+    if scale > 0:
+        return change / scale
+    return 0.0 if change == 0 else np.inf
 
-    Returns
-    -------
-    float
-        Estimated noise variance.
+
+def _penalty_factor(penalty: NDArray) -> NDArray:
+    """Return ``F`` with ``F^T F = penalty``, dropping roundoff-level modes."""
+    eigenvalues, vectors = np.linalg.eigh(penalty)
+    tolerance = len(eigenvalues) * np.finfo(float).eps * np.max(np.abs(eigenvalues))
+    if eigenvalues[0] < -tolerance:
+        raise ValueError(
+            "Penalty matrix is not positive semidefinite: smallest eigenvalue "
+            f"{eigenvalues[0]:.3e} is below -{tolerance:.3e}"
+        )
+    keep = eigenvalues > tolerance
+    if not np.any(keep):
+        raise ValueError(
+            "Penalty matrix has no eigenvalue above the roundoff tolerance "
+            f"{tolerance:.3e}; every lambda gives the same estimate"
+        )
+    return np.sqrt(eigenvalues[keep])[:, None] * vectors[:, keep].T
+
+
+def _shrinkage(values: NDArray, lam: float | NDArray) -> tuple[NDArray, NDArray]:
+    """Return weights ``1 / (1 + lam v)`` and ``1 - weights`` without cancellation."""
+    scaled = np.multiply.outer(lam, values)
+    return 1.0 / (1.0 + scaled), scaled / (1.0 + scaled)
+
+
+class _PenaltyPath:
+    """Solutions of ``(D^T D + lam S) theta = D^T X`` for every lam in [0, inf].
+
+    ``factor`` is a full-row-rank ``F`` with ``F^T F = S``. Whitening with the
+    Cholesky factor of ``D^T D`` and an SVD of the whitened ``F`` give
+    ``B^T D^T D B = I`` and ``B^T S B = diag(values)``. Directions that ``F``
+    does not penalize keep values of exactly zero, so the infinite-penalty
+    limit is the least-squares fit within that null space. ``D^T D`` must be
+    conditioned well enough that normal-equation roundoff, about
+    ``p * eps * cond(D^T D)`` of the template, stays below 1e-7.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
 
-    DtD_dense = np.asarray(
-        DtD.todense() if sp.sparse.issparse(DtD) else DtD, dtype=float
-    )
-    S_dense = np.asarray(S.todense() if sp.sparse.issparse(S) else S, dtype=float)
-    DtX_dense = np.asarray(
-        DtX.todense() if sp.sparse.issparse(DtX) else DtX, dtype=float
-    )
+    def __init__(self, gram: NDArray, cross: NDArray, factor: NDArray) -> None:
+        spectrum = np.linalg.eigvalsh(gram)
+        limit = 1e-7 / (len(gram) * np.finfo(float).eps)
+        if spectrum[0] * limit <= spectrum[-1]:
+            raise np.linalg.LinAlgError(
+                "D^T D is too ill-conditioned for the design-scaled search: "
+                f"eigenvalues span [{spectrum[0]:.3e}, {spectrum[-1]:.3e}], "
+                f"beyond the condition-number limit {limit:.3e}; every template "
+                "sample must be well observed by event windows"
+            )
+        chol = sp.linalg.cholesky(gram, lower=True)
+        whitened = sp.linalg.solve_triangular(chol, factor.T, lower=True).T
+        _, singular, right = sp.linalg.svd(whitened, full_matrices=True)
+        rank_tolerance = len(gram) * np.finfo(float).eps * singular[0]
+        if len(singular) < len(factor) or singular[-1] <= rank_tolerance:
+            raise ValueError(
+                f"Penalty factor of shape {factor.shape} does not have full row "
+                f"rank: smallest whitened singular value {singular[-1]:.3e}"
+            )
+        self.chol: NDArray = chol
+        self.values: NDArray = np.zeros(len(gram))
+        self.values[: len(singular)] = singular**2
+        self.null: NDArray = np.arange(len(gram)) >= len(singular)
+        self.basis: NDArray = sp.linalg.solve_triangular(chol.T, right.T, lower=False)
+        self.rotated: NDArray = self.basis.T @ cross
+        self.ols: NDArray = sp.linalg.cho_solve((chol, True), cross)
 
-    n_cols = X.shape[1] if X.ndim > 1 else 1
+    def weights(self, lam: float) -> NDArray:
+        if np.isposinf(lam):
+            return self.null.astype(float)
+        return _shrinkage(self.values, lam)[0]
 
-    mu, V = sp.linalg.eigh(DtD_dense, DtD_dense + S_dense)
-    mu = np.clip(mu, 0, 1)
-    DtX_rot = V.T @ DtX_dense
-    XtX_sum = np.sum(X**2)
-    n_obs = X.shape[0]
+    def templates(self, lam: float) -> NDArray:
+        return self.basis @ (self.weights(lam)[:, None] * self.rotated)
 
-    lam = 1.0
-    for _ in range(30):
-        g = 1.0 / (mu + lam * (1 - mu) + 1e-30)
-        gamma = np.sum(mu * g)
-        Phi_hat = V @ (g[:, None] * DtX_rot)
-        phi_norm_sq = np.sum(Phi_hat * (S_dense @ Phi_hat))
-        cross = np.sum(DtX_dense * Phi_hat)
-        quad = np.sum(Phi_hat * (DtD_dense @ Phi_hat))
-        residual_ss = XtX_sum - 2 * cross + quad
-        alpha = gamma / (phi_norm_sq / n_cols + 1e-30)
-        beta = (n_obs * n_cols - gamma) / (residual_ss + 1e-30)
-        lam_new = alpha / (beta + 1e-30)
-        if abs(lam_new - lam) / (lam + 1e-30) < 1e-4:
-            lam = lam_new
-            break
-        lam = lam_new
+    def template_change(self, first: float, second: float) -> float:
+        """Template difference between two lambdas over the OLS template norm."""
+        change = np.linalg.norm(self.templates(first) - self.templates(second))
+        return _relative_change(float(change), float(np.linalg.norm(self.ols)))
 
-    templates_flat = sp.sparse.linalg.spsolve(DtD + lam * S, DtX)
-    if templates_flat.ndim == 1:
-        templates_flat = templates_flat.reshape(-1, 1)
+    def variation_bound(self) -> float:
+        """Upper bound on any template difference along the path over the OLS norm.
 
-    if ix is not None and lb is not None and half_win is not None:
-        events = np.unique(lb)
-        M = len(events)
-        T = 2 * half_win
-        templates = templates_flat.T.reshape(n_cols, M, T).transpose(1, 2, 0)
+        Penalized weights stay in [0, 1], so no two lambdas can differ by more
+        than the sum of the penalized modes' template norms. Endpoint
+        differences can cancel because ``B`` is not orthonormal.
+        """
+        penalized = ~self.null
+        bound = np.sum(
+            np.linalg.norm(self.basis[:, penalized], axis=0)
+            * np.linalg.norm(self.rotated[penalized], axis=1)
+        )
+        return _relative_change(float(bound), float(np.linalg.norm(self.ols)))
 
-        epoch_residuals = []
-        for _i, (idx, label) in enumerate(zip(ix, lb)):
-            start = idx - half_win
-            end = idx + half_win
-            if start < 0 or end > len(X):
-                continue
-            epoch = X[start:end]
-            ev_idx = list(events).index(label)
-            predicted = templates[ev_idx]
-            residual = epoch - predicted
-            epoch_residuals.append(residual)
-
-        if epoch_residuals:
-            all_residuals = np.concatenate(epoch_residuals, axis=0)
-            return np.mean(np.var(all_residuals, axis=0))
-
-    sigsq = residual_ss / max(n_obs * n_cols - gamma, 1.0)
-    return sigsq
+    def log10_envelope(self, margin: int = 6) -> tuple[int, int]:
+        """Integer log10 bounds ``margin`` decades beyond every penalty transition."""
+        positive = self.values[~self.null]
+        lower = int(np.floor(-np.log10(np.max(positive)) - margin))
+        upper = int(np.ceil(-np.log10(np.min(positive)) + margin))
+        return lower, upper
 
 
 # --- GCV, L-curve, Empirical Bayes lambda selection ---
-# All operate on the SVD of the regularized normal equations.
-# Given D^T D and Gamma^T Gamma, we compute a joint eigendecomposition
-# so that the regularized solution and all criteria can be evaluated
-# efficiently for any lambda.
+# GCV uses a joint eigendecomposition of the normal equations; the L-curve
+# uses the stable path above.
+# EB uses Cholesky solves and an explicit penalty-nullspace convention.
 
 
 def select_lambda_gcv(
@@ -1929,8 +1372,6 @@ def select_lambda_gcv(
         Best lambda and a diagnostics dict with keys ``'opt_val'`` and
         ``'method'``.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
 
     DtD_dense = np.asarray(
         DtD.todense() if sp.sparse.issparse(DtD) else DtD, dtype=float
@@ -1974,6 +1415,255 @@ def select_lambda_gcv(
     return best_lam, {"opt_val": best_lam, "method": "gcv"}
 
 
+def _lcurve_grid(lower: int, upper: int, n_lambdas: int, density: int) -> NDArray:
+    """Extend the legacy [1e-3, 1e5] log grid with its own anchor and spacing."""
+    segments = (n_lambdas - 1) * density
+    step = 8.0 / segments
+    first = min(0, int(np.floor((lower + 3.0) / step)))
+    last = max(segments, int(np.ceil((upper + 3.0) / step)))
+    grid = np.power(10.0, -3.0 + step * np.arange(first, last + 1))
+    # first <= 0, so 1e-3 sits at this nonnegative index; it is 0 when the
+    # envelope starts at or above 1e-3, leaving nothing below to overwrite.
+    legacy_start = -first
+    if density == 1:
+        grid[legacy_start : legacy_start + n_lambdas] = np.logspace(-3, 5, n_lambdas)
+    return grid
+
+
+def _lcurve_curvature(
+    path: _PenaltyPath, energy: NDArray, residual_zero: float, lambdas: NDArray
+) -> NDArray:
+    """Signed L-curve curvature from analytic log-lambda derivatives.
+
+    With horizontal log-residual, vertical log-penalty, and increasing lambda,
+    the L-curve corner (Hansen and O'Leary 1993) is the convex bend from the
+    steep small-lambda branch to the flat large-lambda branch: a
+    counterclockwise turn, positive here (up to a positive factor, the
+    negative of Hansen's ``lcfun``, which his ``l_corner`` minimizes).
+    Clockwise bends are concave and negative here; under the conditions of
+    Reginska (1996) and Hansen (2000, section 6) they are the ends of the
+    curve. They must not be maximized, and neither must an absolute value
+    that also rewards them.
+    """
+    weights, shrink = _shrinkage(path.values, lambdas)
+    dw = -weights * shrink
+    d2w = dw * (weights - shrink)
+    residual = residual_zero + shrink**2 @ energy
+    residual_d1 = -2.0 * (shrink * dw) @ energy
+    residual_d2 = 2.0 * (dw**2 - shrink * d2w) @ energy
+    penalty = (path.values * weights**2) @ energy
+    penalty_d1 = 2.0 * (path.values * weights * dw) @ energy
+    penalty_d2 = 2.0 * (path.values * (dw**2 + weights * d2w)) @ energy
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dx = residual_d1 / residual
+        dy = penalty_d1 / penalty
+        ddx = residual_d2 / residual - dx**2
+        ddy = penalty_d2 / penalty - dy**2
+        return (dx * ddy - dy * ddx) / (dx**2 + dy**2) ** 1.5
+
+
+class _LcurveCandidate(NamedTuple):
+    grid_index: int
+    lam: float
+    curvature: float
+    success: bool
+    iterations: int
+    function_evaluations: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "grid_index": self.grid_index,
+            "lambda": self.lam,
+            "curvature": self.curvature,
+            "success": self.success,
+            "iterations": self.iterations,
+            "function_evaluations": self.function_evaluations,
+        }
+
+
+class _LcurveCorner(NamedTuple):
+    lambdas: NDArray
+    curvature: NDArray
+    candidates: list[_LcurveCandidate]
+    selected: _LcurveCandidate
+    nonfinite: int
+
+
+def _lcurve_peaks(curvature: NDArray) -> NDArray:
+    """Indices of positive interior local maxima, excluding five points per end."""
+    middle, left, right = curvature[5:-5], curvature[4:-6], curvature[6:-4]
+    finite = np.isfinite(left) & np.isfinite(middle) & np.isfinite(right)
+    with np.errstate(invalid="ignore"):
+        peak = finite & (middle > 0) & (middle >= left) & (middle >= right)
+    return np.flatnonzero(peak) + 5
+
+
+def _refine_lcurve_peak(
+    path: _PenaltyPath,
+    energy: NDArray,
+    residual_zero: float,
+    lambdas: NDArray,
+    curvature: NDArray,
+    index: int,
+) -> _LcurveCandidate:
+    """Refine a grid peak in log lambda, never returning less than the peak."""
+
+    def negative_curvature(log_lam: float) -> float:
+        lam = np.exp(np.array([log_lam]))
+        return -float(_lcurve_curvature(path, energy, residual_zero, lam)[0])
+
+    result = sp.optimize.minimize_scalar(
+        negative_curvature,
+        bounds=(float(np.log(lambdas[index - 1])), float(np.log(lambdas[index + 1]))),
+        method="bounded",
+        options={"xatol": 1e-10, "maxiter": 200, "disp": 0},
+    )
+    lam, value = float(np.exp(result.x)), -float(result.fun)
+    if not value >= curvature[index]:
+        lam, value = float(lambdas[index]), float(curvature[index])
+    return _LcurveCandidate(
+        index, lam, value, bool(result.success), int(result.nit), int(result.nfev)
+    )
+
+
+def _lcurve_corner(
+    path: _PenaltyPath, energy: NDArray, residual_zero: float, lambdas: NDArray
+) -> _LcurveCorner:
+    """Refine every positive interior curvature peak and keep the largest."""
+    curvature = _lcurve_curvature(path, energy, residual_zero, lambdas)
+    eligible = len(lambdas) - 10
+    nonfinite = int(np.count_nonzero(~np.isfinite(curvature[5:-5])))
+    if nonfinite == eligible:
+        raise ValueError(
+            f"L-curve has no finite curvature among {eligible} eligible grid points"
+        )
+    peaks = _lcurve_peaks(curvature)
+    if len(peaks) == 0:
+        raise ValueError(
+            f"L-curve has no positive interior curvature peak among {eligible} "
+            f"eligible grid points in [{lambdas[0]:.3g}, {lambdas[-1]:.3g}]; "
+            "no corner is selected"
+        )
+    candidates = [
+        _refine_lcurve_peak(path, energy, residual_zero, lambdas, curvature, int(index))
+        for index in peaks
+    ]
+    selected = max(candidates, key=lambda candidate: candidate.curvature)
+    return _LcurveCorner(lambdas, curvature, candidates, selected, nonfinite)
+
+
+def _lcurve_stability(
+    path: _PenaltyPath,
+    energy: NDArray,
+    residual_zero: float,
+    reference: _LcurveCandidate,
+    lambdas: NDArray,
+) -> dict[str, object]:
+    """Compare the corner found on a check grid with the reference corner."""
+    try:
+        check = _lcurve_corner(path, energy, residual_zero, lambdas).selected
+    except ValueError as error:
+        return {"passed": False, "error": str(error)}
+    template_change = path.template_change(check.lam, reference.lam)
+    curvature_change = _relative_change(
+        abs(check.curvature - reference.curvature), reference.curvature
+    )
+    return {
+        "lambda": check.lam,
+        "curvature": check.curvature,
+        "template_change_over_ols_norm": template_change,
+        "relative_curvature_change": curvature_change,
+        "passed": template_change <= 1e-5 and curvature_change <= 1e-5,
+    }
+
+
+def _warn_lcurve(
+    corner: _LcurveCorner, stability: dict[str, dict[str, object]]
+) -> None:
+    if corner.nonfinite:
+        warnings.warn(
+            f"L-curve excluded {corner.nonfinite} nonfinite eligible curvature values.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    unconverged = [row.grid_index for row in corner.candidates if not row.success]
+    if unconverged:
+        warnings.warn(
+            "L-curve corner refinement did not converge for grid peaks "
+            f"{unconverged}; their best evaluated points are retained.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    failed = {name: row for name, row in stability.items() if not row["passed"]}
+    if failed:
+        warnings.warn(
+            f"L-curve corner is not stable under the {', '.join(failed)} check: "
+            "allowed changes are 1e-5 of the OLS template norm and 1e-5 relative "
+            f"curvature; got {failed}. Review this fit.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _select_lcurve(
+    path: _PenaltyPath,
+    X: NDArray,
+    D: NDArray | scipy.sparse.spmatrix,
+    n_lambdas: int = 80,
+) -> tuple[float, dict[str, object]]:
+    if n_lambdas < 11:
+        raise ValueError(f"L-curve requires at least 11 grid points, got {n_lambdas}")
+    energy = np.sum(path.rotated**2, axis=1)
+    variation = path.variation_bound()
+    # Within the stability tolerance every lambda gives the same estimate, and
+    # roundoff in the penalized modes would draw a plausible-looking corner.
+    if variation <= 1e-5:
+        raise ValueError(
+            "L-curve is undefined: templates along the whole regularization "
+            f"path differ by at most {variation:.3e} of the OLS norm, within "
+            "the 1e-5 stability tolerance"
+        )
+    fitted = np.asarray(D @ path.ols)
+    residual_zero = float(np.sum((np.asarray(X, dtype=float) - fitted) ** 2))
+    lower, upper = path.log10_envelope()
+    corner = _lcurve_corner(
+        path, energy, residual_zero, _lcurve_grid(lower, upper, n_lambdas, 1)
+    )
+    checks = {"denser": (lower, upper, 2), "outer": (lower - 2, upper + 2, 1)}
+    stability = {
+        name: _lcurve_stability(
+            path,
+            energy,
+            residual_zero,
+            corner.selected,
+            _lcurve_grid(low, high, n_lambdas, density),
+        )
+        for name, (low, high, density) in checks.items()
+    }
+    _warn_lcurve(corner, stability)
+    selected, index = corner.selected, corner.selected.grid_index
+    return selected.lam, {
+        "opt_val": selected.lam,
+        "method": "lcurve",
+        "grid_index": index,
+        "grid_size": len(corner.lambdas),
+        "grid_min": float(corner.lambdas[0]),
+        "grid_max": float(corner.lambdas[-1]),
+        "grid_log10_envelope": (lower, upper),
+        "excluded_edge_points": 5,
+        "at_first_eligible": index == 5,
+        "at_last_eligible": index == len(corner.lambdas) - 6,
+        "selected_grid_lambda": float(corner.lambdas[index]),
+        "selected_grid_curvature": float(corner.curvature[index]),
+        "selected_curvature": selected.curvature,
+        "positive_corner": True,
+        "corner_candidates": [row.as_dict() for row in corner.candidates],
+        "nonfinite_eligible_curvatures": corner.nonfinite,
+        "stability": stability,
+        "stability_passed": all(bool(row["passed"]) for row in stability.values()),
+    }
+
+
 def select_lambda_lcurve(
     DtD: NDArray | scipy.sparse.spmatrix,
     DtX: NDArray | scipy.sparse.spmatrix,
@@ -1982,80 +1672,228 @@ def select_lambda_lcurve(
     D: NDArray | scipy.sparse.spmatrix,
     n_lambdas: int = 80,
 ) -> tuple[float, dict[str, object]]:
-    """Select regularization lambda via L-curve (maximum curvature).
+    """Select regularization lambda via L-curve (maximum convex curvature).
 
-    Uses generalized eigendecomposition with correct V norms.
+    The log grid keeps the legacy [1e-3, 1e5] anchor and spacing of
+    ``8 / (n_lambdas - 1)`` decades and extends it to six decades beyond the
+    penalty's first and last transition scales. Residual and penalty norms
+    and their log-lambda derivatives are evaluated analytically on a stable
+    path. Five grid points at each end are excluded, every positive interior
+    curvature peak is refined in log lambda, and the largest refined peak is
+    the corner. A grid with doubled density and one with two extra decades at
+    each end must reproduce it within 1e-5 of the OLS template norm and 1e-5
+    relative curvature; otherwise the fit is flagged with a warning. Without
+    a positive interior peak, or when no two lambdas can change the template
+    by more than 1e-5 of the OLS norm (every lambda gives the same estimate),
+    no corner is invented and ValueError is raised.
 
     Parameters
     ----------
     DtD : NDArray | scipy.sparse.spmatrix
-        Gram matrix ``D^T D`` of shape ``(p, p)``.
+        Gram matrix ``D^T D`` of shape ``(p, p)``; its condition number must
+        stay below ``1e-7 / (p * eps)``.
     DtX : NDArray | scipy.sparse.spmatrix
         Cross-product ``D^T X`` of shape ``(p, C)``.
     S : NDArray | scipy.sparse.spmatrix
-        Penalty matrix of shape ``(p, p)``.
+        Positive semidefinite penalty matrix of shape ``(p, p)``. Eigenvalues
+        at most ``p * eps`` times the largest are treated as exact zeros.
     X : NDArray
         Data matrix of shape ``(n, C)``.
     D : NDArray | scipy.sparse.spmatrix
         Design matrix of shape ``(n, p)``.
     n_lambdas : int
-        Number of candidate lambda values on the log-spaced grid.
+        Points on the legacy [1e-3, 1e5] segment, which sets the grid
+        spacing; at least 11.
 
     Returns
     -------
     tuple[float, dict[str, object]]
-        Best lambda and a diagnostics dict with keys ``'opt_val'`` and
-        ``'method'``.
+        Corner lambda and diagnostics for the grid, refined candidates, and
+        stability checks.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
+    path = _PenaltyPath(_dense(DtD), _dense(DtX), _penalty_factor(_dense(S)))
+    return _select_lcurve(path, X, D, n_lambdas)
 
-    DtD_dense = np.asarray(
-        DtD.todense() if sp.sparse.issparse(DtD) else DtD, dtype=float
-    )
-    S_dense = np.asarray(S.todense() if sp.sparse.issparse(S) else S, dtype=float)
-    DtX_dense = np.asarray(
-        DtX.todense() if sp.sparse.issparse(DtX) else DtX, dtype=float
-    )
 
-    XtX_sum = np.sum(X**2)
+class _EmpBayesSystem:
+    """Shared white-noise EB statistics with flat unpenalized components."""
 
-    mu, V = sp.linalg.eigh(DtD_dense, DtD_dense + S_dense)
-    mu = np.clip(mu, 0, 1)
-    DtX_rot = V.T @ DtX_dense
+    def __init__(
+        self,
+        DtD: NDArray | scipy.sparse.spmatrix,
+        DtX: NDArray | scipy.sparse.spmatrix,
+        S: NDArray | scipy.sparse.spmatrix,
+        X: NDArray,
+        D: NDArray | scipy.sparse.spmatrix,
+    ) -> None:
+        gram = _EmpBayesSystem._dense(DtD, "DtD")
+        cross = _EmpBayesSystem._dense(DtX, "DtX")
+        penalty = _EmpBayesSystem._dense(S, "S")
+        data = _EmpBayesSystem._dense(X, "X")
+        if data.ndim == 1:
+            data = data[:, None]
+        if cross.ndim == 1:
+            cross = cross[:, None]
+        if data.ndim != 2 or min(data.shape) == 0:
+            raise ValueError("EB requires a nonempty data matrix")
+        n_obs, n_cols = data.shape
+        if gram.ndim != 2 or gram.shape[0] == 0:
+            raise ValueError("EB requires a nonempty Gram matrix")
+        n_parameters = gram.shape[0]
+        if gram.shape != (n_parameters, n_parameters):
+            raise ValueError("EB Gram matrix must be square")
+        if penalty.shape != gram.shape:
+            raise ValueError("EB penalty and Gram matrices must have equal shapes")
+        if cross.shape != (n_parameters, n_cols):
+            raise ValueError("EB cross-product shape does not match the model")
+        if sp.sparse.issparse(D):
+            sparse_design = sp.sparse.csr_matrix(D)
+            _EmpBayesSystem._dense(sparse_design.data, "D entries")
+            design = sp.sparse.csr_matrix(sparse_design, dtype=float)
+        else:
+            design = _EmpBayesSystem._dense(D, "D")
+        if design.shape != (n_obs, n_parameters):
+            raise ValueError("EB design shape does not match the data and Gram matrix")
+        _EmpBayesSystem._psd_eigenvalues(gram, "DtD")
+        values = _EmpBayesSystem._psd_eigenvalues(penalty, "S")
+        # This is a numerical rank test, not a ridge or a change to S.
+        rank_tolerance = float(
+            n_parameters * np.finfo(float).eps * np.max(np.abs(values))
+        )
+        rank = int(np.count_nonzero(values > rank_tolerance))
+        nullity = n_parameters - rank
+        if rank == 0:
+            raise ValueError("EB smoothing precision requires a nonzero penalty rank")
+        if n_obs <= nullity:
+            raise ValueError(
+                "EB requires residual degrees of freedom beyond the nullspace"
+            )
+        self.gram = gram
+        self.cross = cross
+        self.penalty = penalty
+        self.data = data
+        self.design = design
+        self.n_obs = n_obs
+        self.n_cols = n_cols
+        self.rank_tolerance = rank_tolerance
+        self.rank = rank
+        self.nullity = nullity
 
-    lambdas = np.logspace(-3, 5, n_lambdas)
-    residual_ss = np.zeros(n_lambdas)
-    solution_ss = np.zeros(n_lambdas)
+    @staticmethod
+    def _dense(value: NDArray | scipy.sparse.spmatrix, name: str) -> NDArray:
+        array = np.asarray(value.todense() if sp.sparse.issparse(value) else value)
+        if not np.isrealobj(array):
+            raise ValueError(f"EB requires real-valued {name}")
+        array = np.asarray(array, dtype=float)
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"EB requires finite {name}")
+        return array
 
-    for i, lam in enumerate(lambdas):
-        g = 1.0 / (mu + lam * (1 - mu) + 1e-30)
-        Phi_hat = V @ (g[:, None] * DtX_rot)
-        # ||X - D Phi||^2
-        cross = np.sum(DtX_dense * Phi_hat)
-        quad = np.sum(Phi_hat * (DtD_dense @ Phi_hat))
-        residual_ss[i] = XtX_sum - 2 * cross + quad
-        # ||Gamma Phi||^2 = Phi^T S Phi
-        solution_ss[i] = np.sum(Phi_hat * (S_dense @ Phi_hat))
+    @staticmethod
+    def _psd_eigenvalues(matrix: NDArray, name: str) -> NDArray:
+        tolerance = len(matrix) * np.finfo(float).eps * np.max(np.abs(matrix))
+        if not np.allclose(matrix, matrix.T, rtol=0, atol=tolerance):
+            raise ValueError(f"EB requires symmetric {name}")
+        values = sp.linalg.eigvalsh(matrix)
+        tolerance = len(matrix) * np.finfo(float).eps * np.max(np.abs(values))
+        if np.min(values) < -tolerance:
+            raise ValueError(f"EB requires positive-semidefinite {name}")
+        return values
 
-    residual_ss = np.maximum(residual_ss, 1e-30)
-    solution_ss = np.maximum(solution_ss, 1e-30)
+    def statistics(self, lam: float) -> tuple[NDArray, float, float, float]:
+        factor = sp.linalg.cho_factor(self.gram + lam * self.penalty, lower=True)
+        theta = sp.linalg.cho_solve(factor, self.cross)
+        gamma = float(np.trace(sp.linalg.cho_solve(factor, self.gram)))
+        # Direct residuals avoid subtraction of nearly equal quadratic forms.
+        residual_ss = float(np.sum((self.data - self.design @ theta) ** 2))
+        penalty_ss = float(np.sum(theta * (self.penalty @ theta)))
+        return theta, gamma, residual_ss, penalty_ss
 
-    xi = np.log(residual_ss)
-    eta = np.log(solution_ss)
-    log_lam = np.log(lambdas)
+    def update(
+        self, gamma: float, residual_ss: float, penalty_ss: float
+    ) -> tuple[float, float]:
+        quantities = {
+            "penalized effective parameter count": gamma - self.nullity,
+            "residual degrees of freedom": self.n_obs - gamma,
+            "residual sum of squares": residual_ss,
+            "penalty sum of squares": penalty_ss,
+        }
+        for name, value in quantities.items():
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"Invalid EB {name}: {value}")
+        alpha = self.n_cols * (gamma - self.nullity) / penalty_ss
+        beta = self.n_cols * (self.n_obs - gamma) / residual_ss
+        if not np.isfinite(alpha) or not np.isfinite(beta) or alpha <= 0 or beta <= 0:
+            raise ValueError("EB precision update is not finite and positive")
+        updated = alpha / beta
+        if not np.isfinite(updated) or updated <= 0:
+            raise ValueError("EB lambda update is not finite and positive")
+        noise_var = 1.0 / beta
+        if not np.isfinite(noise_var) or noise_var <= 0:
+            raise ValueError("EB noise variance is not finite and positive")
+        return float(updated), float(noise_var)
 
-    dxi = np.gradient(xi, log_lam)
-    deta = np.gradient(eta, log_lam)
-    d2xi = np.gradient(dxi, log_lam)
-    d2eta = np.gradient(deta, log_lam)
 
-    curvature = (dxi * d2eta - deta * d2xi) / (dxi**2 + deta**2) ** 1.5
-    curvature[:5] = -np.inf
-    curvature[-5:] = -np.inf
-
-    best_idx = np.argmax(curvature)
-    return lambdas[best_idx], {"opt_val": lambdas[best_idx], "method": "lcurve"}
+def _fit_empbayes(
+    DtD: NDArray | scipy.sparse.spmatrix,
+    DtX: NDArray | scipy.sparse.spmatrix,
+    S: NDArray | scipy.sparse.spmatrix,
+    X: NDArray,
+    D: NDArray | scipy.sparse.spmatrix,
+    max_iter: int,
+    tol: float,
+) -> tuple[float, NDArray, float, dict[str, object]]:
+    if (
+        isinstance(max_iter, bool)
+        or not isinstance(max_iter, (int, np.integer))
+        or max_iter < 1
+    ):
+        raise ValueError("EB max_iter must be a positive integer")
+    if not np.isfinite(tol) or tol <= 0:
+        raise ValueError("EB tolerance must be finite and positive")
+    system = _EmpBayesSystem(DtD, DtX, S, X, D)
+    lam = 1.0
+    converged = False
+    theta, gamma, residual_ss, penalty_ss = system.statistics(lam)
+    relative_update = 0.0
+    for _iteration in range(1, max_iter + 1):
+        updated, _ = system.update(gamma, residual_ss, penalty_ss)
+        relative_update = abs(updated - lam) / lam
+        if not np.isfinite(relative_update):
+            raise ValueError("EB relative update is not finite")
+        lam = updated
+        # Return diagnostics and the fit at the returned lambda, not its predecessor.
+        theta, gamma, residual_ss, penalty_ss = system.statistics(lam)
+        if relative_update < tol:
+            converged = True
+            break
+    next_lam, noise_var = system.update(gamma, residual_ss, penalty_ss)
+    fixed_point_update = abs(next_lam - lam) / lam
+    if not np.isfinite(fixed_point_update):
+        raise ValueError("EB final fixed-point residual is not finite")
+    info: dict[str, object] = {
+        "opt_val": lam,
+        "method": "empbayes",
+        "gamma": gamma,
+        "gamma_total": system.n_cols * gamma,
+        "gamma_penalized": gamma - system.nullity,
+        "gamma_penalized_total": system.n_cols * (gamma - system.nullity),
+        "n_iter": _iteration,
+        "converged": converged,
+        "status": "converged" if converged else "iteration_limit",
+        "penalty_rank": system.rank,
+        "penalty_nullity": system.nullity,
+        "penalty_rank_tolerance": system.rank_tolerance,
+        "noise_var": noise_var,
+        "residual_ss": residual_ss,
+        "penalty_ss": penalty_ss,
+        "last_relative_update": float(relative_update),
+        "fixed_point_relative_update": float(fixed_point_update),
+        "initial_lambda": 1.0,
+        "max_iter": int(max_iter),
+        "tolerance": float(tol),
+    }
+    return lam, theta, noise_var, info
 
 
 def select_lambda_empbayes(
@@ -2069,8 +1907,10 @@ def select_lambda_empbayes(
 ) -> tuple[float, dict[str, object]]:
     """Select regularization lambda via Empirical Bayes (Evidence Maximization).
 
-    Uses MacKay's iterative update equations with correct V norms.
-    V from ``eigh(DtD, DtD+S)`` is B-orthonormal, **not** orthonormal.
+    Uses shared precision parameters across channels. Unpenalized coefficients
+    have flat priors independent of those precisions. The resulting restricted
+    evidence is ordinary Gaussian evidence when the penalty is full rank.
+    The penalty nullspace must be identifiable through the design matrix.
 
     Parameters
     ----------
@@ -2092,219 +1932,14 @@ def select_lambda_empbayes(
     Returns
     -------
     tuple[float, dict[str, object]]
-        Converged lambda and a diagnostics dict with keys ``'opt_val'``,
-        ``'gamma'``, ``'n_iter'``, and ``'method'``.
+        Last finite lambda and diagnostics, including convergence status,
+        penalty rank/nullity, effective parameter counts, noise variance,
+        and the final fixed-point residual. ``gamma`` is per channel.
+        An iteration limit is not reported as convergence. Invalid updates
+        or a non-positive-definite posterior precision raise an exception.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
-
-    DtD_dense = np.asarray(
-        DtD.todense() if sp.sparse.issparse(DtD) else DtD, dtype=float
-    )
-    S_dense = np.asarray(S.todense() if sp.sparse.issparse(S) else S, dtype=float)
-    DtX_dense = np.asarray(
-        DtX.todense() if sp.sparse.issparse(DtX) else DtX, dtype=float
-    )
-
-    n_obs = X.shape[0]
-    n_cols = X.shape[1] if X.ndim > 1 else 1
-    XtX_sum = np.sum(X**2)
-
-    mu, V = sp.linalg.eigh(DtD_dense, DtD_dense + S_dense)
-    mu = np.clip(mu, 0, 1)
-    DtX_rot = V.T @ DtX_dense
-
-    lam = 1.0
-    n_iters_run = 0
-
-    for _iteration in range(max_iter):
-        n_iters_run = _iteration + 1
-        g = 1.0 / (mu + lam * (1 - mu) + 1e-30)
-
-        # Effective number of parameters: tr(DtD (DtD+lam*S)^{-1}) = sum(mu_i * g_i)
-        gamma = np.sum(mu * g)
-
-        # Phi_hat in original basis
-        Phi_hat = V @ (g[:, None] * DtX_rot)
-
-        # ||Gamma Phi||^2 = Phi^T S Phi
-        phi_norm_sq = np.sum(Phi_hat * (S_dense @ Phi_hat))
-
-        # ||X - D Phi||^2
-        cross = np.sum(DtX_dense * Phi_hat)
-        quad = np.sum(Phi_hat * (DtD_dense @ Phi_hat))
-        residual_ss = XtX_sum - 2 * cross + quad
-
-        # MacKay updates
-        alpha = gamma / (phi_norm_sq / n_cols + 1e-30)
-        beta = (n_obs * n_cols - gamma) / (residual_ss + 1e-30)
-
-        lam_new = alpha / (beta + 1e-30)
-
-        if abs(lam_new - lam) / (lam + 1e-30) < tol:
-            lam = lam_new
-            break
-        lam = lam_new
-
-    return lam, {
-        "opt_val": lam,
-        "gamma": gamma,
-        "n_iter": n_iters_run,
-        "method": "empbayes",
-    }
-
-
-# --- xDAWN spatial filtering ---
-
-
-def xdawn_filter(
-    data: NDArray,
-    ix: NDArray,
-    lb: NDArray,
-    half_win: int,
-    n_components: int | None = None,
-) -> tuple[NDArray, NDArray, NDArray]:
-    """Compute xDAWN spatial filters (Rivet et al., 2009).
-
-    Finds spatial filters W that maximize the signal-to-signal-plus-noise
-    ratio of the evoked response via the generalized eigenvalue problem
-    ``Sigma_signal w = lambda Sigma_x w``.
-
-    Parameters
-    ----------
-    data : NDArray
-        Continuous data of shape ``(T, C)``.
-    ix : NDArray
-        1-D integer array of event-onset indices of shape ``(N,)``.
-    lb : NDArray
-        1-D array of event labels of shape ``(N,)``.
-    half_win : int
-        Half-width of the template window.
-    n_components : int | None
-        Number of spatial components to keep.  If *None*, all *C* components
-        are retained.
-
-    Returns
-    -------
-    tuple[NDArray, NDArray, NDArray]
-        ``(data_filtered, W, A)`` where *data_filtered* has shape
-        ``(T, n_components)``, *W* has shape ``(C, n_components)`` (spatial
-        filters), and *A* has shape ``(n_components, C)`` (spatial patterns
-        for interpretation).
-    """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
-
-    events = np.unique(lb)
-    C = data.shape[1]
-
-    if n_components is None:
-        n_components = C
-
-    D = get_design_matrix(data, ix, lb, half_win=half_win, events=events)
-
-    # Signal covariance estimate: D (D^T D)^{-1} D^T approximates the signal subspace
-    # For xDAWN: maximize w^T Sigma_signal w / w^T Sigma_x w
-    XtX = data.T @ data
-    DtD = D.T @ D
-
-    # Evoked signal estimate (OLS)
-    Phi_ols = np.linalg.solve(DtD + 1e-6 * np.eye(DtD.shape[0]), D.T @ data)
-    signal_estimate = D @ Phi_ols
-    Sigma_signal = signal_estimate.T @ signal_estimate
-
-    # Solve generalized eigenvalue problem
-    eigvals, eigvecs = sp.linalg.eigh(Sigma_signal, XtX + 1e-6 * np.eye(C))
-
-    # Sort by descending eigenvalue
-    idx = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[idx]
-    W = eigvecs[:, idx[:n_components]]
-
-    # Normalize filters
-    for j in range(n_components):
-        W[:, j] /= np.linalg.norm(W[:, j])
-
-    # Spatial patterns (for interpretation): A = Sigma_x W (W^T Sigma_x W)^{-1}
-    A = XtX @ W @ np.linalg.inv(W.T @ XtX @ W)
-
-    data_filtered = data @ W
-    return data_filtered, W, A
-
-
-def get_events_templates_xdawn(
-    data: NDArray,
-    ix: NDArray,
-    lb: NDArray,
-    half_win: int = 100,
-    n_components: int | None = None,
-    reg_temporal: float = 0,
-    opt_reg_temporal: bool = False,
-    omega: float = 0.5,
-    vec_mode: bool = False,
-    vlen: int = 3,
-    symm: bool = True,
-    reg_method: str | None = None,
-) -> tuple[dict[object, NDArray], dict[str, object] | None]:
-    """Estimate templates with xDAWN spatial filtering.
-
-    First applies xDAWN to reduce dimensionality and enhance evoked SNR,
-    then estimates templates in the filtered space.
-
-    Parameters
-    ----------
-    data : NDArray
-        Continuous data of shape ``(T, C)``.
-    ix : NDArray
-        1-D integer array of event-onset indices.
-    lb : NDArray
-        1-D array of event labels.
-    half_win : int
-        Half-width of the template window.
-    n_components : int | None
-        Number of xDAWN spatial components to keep.
-    reg_temporal : float
-        Temporal regularization strength.
-    opt_reg_temporal : bool
-        If *True*, optimize regularization via SURE.
-    omega : float
-        SURE weighting parameter.
-    vec_mode : bool
-        If *True*, optimize the convolution kernel via SURE.
-    vlen : int
-        Length of the convolution kernel seed.
-    symm : bool
-        If *True*, enforce symmetric kernel.
-    reg_method : str | None
-        Lambda selection method (``'gcv'``, ``'lcurve'``, ``'empbayes'``).
-
-    Returns
-    -------
-    tuple[dict[object, NDArray], dict[str, object] | None]
-        ``(templates, inner)`` where *templates* maps event labels to arrays
-        of shape ``(2 * half_win, C)`` in the original channel space, and
-        *inner* holds optimization diagnostics or *None*.
-    """
-    data_f, W, A = xdawn_filter(data, ix, lb, half_win, n_components=n_components)
-
-    templates_f, inner = get_events_templates(
-        data_f,
-        ix,
-        lb,
-        half_win=half_win,
-        method="ls",
-        reg_temporal=reg_temporal,
-        opt_reg_temporal=opt_reg_temporal,
-        omega=omega,
-        vec_mode=vec_mode,
-        vlen=vlen,
-        symm=symm,
-        reg_method=reg_method,
-    )
-
-    # Project templates back to original channel space for SNR comparison
-    templates = {k: v @ W.T for k, v in templates_f.items()}
-    return templates, inner
+    lam, _, _, info = _fit_empbayes(DtD, DtX, S, X, D, max_iter, tol)
+    return lam, info
 
 
 # --- Helpers for get_events_templates SURE optimization ---
@@ -2329,12 +1964,90 @@ def _gen_h_diff(n: int) -> NDArray:
     return h_diff
 
 
+class _AR1Noise(NamedTuple):
+    """Explicit AR(1) covariance inputs; *None* fields use the estimates."""
+
+    phi: float | None = None
+    noise_var: float | None = None
+    noise_var_scale: float = 1.0
+
+
+class _ColoredNoise(NamedTuple):
+    covariance: NDArray | None
+    noise_var: float
+    record: dict[str, object]
+
+
+def _colored_covariance(
+    data: NDArray,
+    ix: NDArray,
+    lb: NDArray,
+    events: NDArray,
+    half_win: int,
+    noise_est: str,
+    sigsq: float,
+    event_blocks: NDArray | None,
+    ar1: _AR1Noise | None,
+    verbose: bool = False,
+) -> _ColoredNoise:
+    """Build D^T Sigma_W D for the colored SURE paths (*None* for white noise).
+
+    *ar1* None means no explicit inputs. AR(1) uses ``ar1.phi`` unclipped
+    when given, else :func:`estimate_phi`, and ``ar1.noise_var`` when given,
+    else ``sigsq`` times a non-unit ``ar1.noise_var_scale``. The record
+    holds the estimated and used values, or the AR(3) autocovariance.
+    """
+    if noise_est == "ar1_colored":
+        ar1 = _AR1Noise() if ar1 is None else ar1
+        phi_estimated = estimate_phi(data, ix, half_win)
+        phi = phi_estimated if ar1.phi is None else ar1.phi
+        if ar1.noise_var is not None:
+            noise_var = ar1.noise_var
+        elif ar1.noise_var_scale != 1:
+            noise_var = sigsq * ar1.noise_var_scale
+        else:
+            noise_var = sigsq
+        covariance = build_DtSigmaD_ar1(
+            ix,
+            lb,
+            events,
+            half_win,
+            phi,
+            noise_var,
+            data_length=len(data),
+            event_blocks=event_blocks,
+        )
+        if verbose:
+            print(f"phi: {phi:.3f}, correction vs white: {(1 + phi) / (1 - phi):.1f}x")
+        record: dict[str, object] = {
+            "phi_estimated": float(phi_estimated),
+            "phi_used": float(phi),
+            "noise_var_estimated": float(sigsq),
+            "noise_var_scale": float(ar1.noise_var_scale),
+        }
+        return _ColoredNoise(covariance, noise_var, record)
+    if noise_est == "ar3_colored":
+        ar_order = 3
+        acf = estimate_acf_ar(
+            data,
+            ix,
+            half_win,
+            ar_order=ar_order,
+            max_lag=_required_covariance_lag(ix, lb, events, half_win, len(data)),
+        )
+        covariance = build_DtSigmaD_acf(
+            ix, lb, events, half_win, acf, len(data), event_blocks
+        )
+        if verbose:
+            print(f"AR({ar_order}) ACF[0:5]: {acf[:5]}")
+        return _ColoredNoise(covariance, sigsq, {"ar3_acf": acf})
+    return _ColoredNoise(None, sigsq, {})
+
+
 def _optimize_kernel(
     data: NDArray,
     a: scipy.sparse.spmatrix,
     b: scipy.sparse.spmatrix,
-    d: scipy.sparse.spmatrix,
-    temporal_mat: scipy.sparse.spmatrix,
     ix: NDArray,
     lb: NDArray,
     events: NDArray,
@@ -2346,61 +2059,40 @@ def _optimize_kernel(
     vlen: int,
     symm: bool,
     verbose: bool,
-    data_raw: NDArray | None,
-    bandpass: tuple[float, float] | None,
-    fs: float | None,
-    noise_band: tuple[float, float] | None,
+    event_blocks: NDArray | None = None,
+    ar1: _AR1Noise | None = None,
 ) -> tuple[float, scipy.sparse.spmatrix, dict[str, object]]:
     """Optimize the convolution kernel via SURE (vec_mode).
 
     Returns the regularization strength (always 1.0), the updated
-    temporal penalty matrix, and a diagnostics dict.
+    temporal penalty matrix, and a diagnostics dict. *event_blocks* labels
+    each event's recording block for the colored covariance; *ar1* holds
+    explicit AR(1) inputs.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
 
+    if event_blocks is not None:
+        _check_block_noise(noise_est, lb, half_win)
     theta_ml = np.linalg.inv(a.todense()) @ b
     sigsq = est_noise_var(
         data,
         method=noise_est
         if noise_est not in {"ar1_colored", "ar3_colored"}
         else "baseline",
-        DtD=a,
-        DtX=b,
-        S=temporal_mat,
-        X=data,
-        D=d,
         ix=ix,
         lb=lb,
         half_win=half_win,
-        data_raw=data_raw,
-        bandpass=bandpass,
-        fs=fs,
-        noise_band=noise_band,
     )
 
-    DtSigmaD_vec = None
-    if noise_est == "ar1_colored":
-        phi = estimate_phi(data, ix, half_win)
-        DtSigmaD_vec = build_DtSigmaD_ar1(
-            ix, lb, events, half_win, phi, sigsq, data_length=len(data)
-        )
-        if verbose:
-            print(f"phi: {phi:.3f}, correction vs white: {(1 + phi) / (1 - phi):.1f}x")
-    elif noise_est == "ar3_colored":
-        ar_order = 3
-        acf = estimate_acf_ar(data, ix, half_win, ar_order=ar_order)
-        DtSigmaD_vec = build_DtSigmaD_acf(
-            ix, lb, events, half_win, acf, data_length=len(data)
-        )
-        if verbose:
-            print(f"AR({ar_order}) ACF[0:5]: {acf[:5]}")
+    colored = _colored_covariance(
+        data, ix, lb, events, half_win, noise_est, sigsq, event_blocks, ar1, verbose
+    )
+    sigsq = colored.noise_var
+    DtSigmaD_vec = colored.covariance
 
     x0 = _gen_h_diff(vlen)
     x0 = x0[: int(vlen - ((vlen - 1) / 2) * int(symm))]
 
-    cost_at_x0 = SURE_cost_vec(
-        x0,
+    objective = _KernelSUREObjective(
         a.todense(),
         theta_ml,
         data,
@@ -2410,22 +2102,14 @@ def _optimize_kernel(
         omega,
         DtSigmaD=DtSigmaD_vec,
     )
+    cost_at_x0, _ = objective.value_gradient(x0)
     cost_scale = max(abs(cost_at_x0), 1e-30)
+    objective.cost_scale = cost_scale
 
     opt_res = sp.optimize.minimize(
-        SURE_cost_vec,
+        objective.value_gradient,
         x0=x0,
-        args=(
-            a.todense(),
-            theta_ml,
-            data,
-            sigsq,
-            M,
-            symm,
-            omega,
-            cost_scale,
-            DtSigmaD_vec,
-        ),
+        jac=True,
         method=None,
         options={"maxiter": 50, "disp": 0},
     )
@@ -2441,172 +2125,601 @@ def _optimize_kernel(
         print(f"noise var: {sigsq}")
         print(f"cost func: {opt_res.fun}")
 
+    # With no bounds or constraints, method=None selects BFGS. Its returned
+    # results include jac and njev even when it stops without converging.
     inner: dict[str, object] = {
         "opt_val": opt_vec,
         "noise_var": sigsq,
         "cost": opt_res.fun,
+        "optimizer_success": bool(opt_res.success),
+        "optimizer_status": int(opt_res.status),
+        "optimizer_message": str(opt_res.message),
+        "optimizer_iterations": int(opt_res.nit),
+        "optimizer_function_evaluations": int(opt_res.nfev),
+        "optimizer_gradient_evaluations": int(opt_res.njev),
+        "optimizer_gradient_norm": float(np.linalg.norm(opt_res.jac)),
+        "optimizer_gradient_max_abs": float(np.max(np.abs(opt_res.jac))),
+        "optimizer_cost_scale": float(cost_scale),
     }
+    inner.update(colored.record)
     return reg_temporal, temporal_mat, inner
+
+
+def _local_minimum_brackets(
+    grid: NDArray, scores: NDArray
+) -> list[tuple[float, float]]:
+    """Bracket each sampled local minimum, skipping exactly flat triples."""
+    local = (
+        (scores[1:-1] <= scores[:-2])
+        & (scores[1:-1] <= scores[2:])
+        & ((scores[1:-1] < scores[:-2]) | (scores[1:-1] < scores[2:]))
+    )
+    indices = np.flatnonzero(local) + 1
+    return [(float(grid[index - 1]), float(grid[index + 1])) for index in indices]
+
+
+_ScalarCandidate = tuple[float, float, str, int]
+
+
+class _ScalarScan(NamedTuple):
+    grid: NDArray
+    scores: NDArray
+    selected: _ScalarCandidate | None
+
+
+class _SolveRecord(NamedTuple):
+    search: str
+    bounds: tuple[float, float]
+    lam: float
+    cost: float
+    success: bool
+    status: int
+    message: str
+    iterations: int
+    function_evaluations: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "search": self.search,
+            "bounds": self.bounds,
+            "lambda": self.lam,
+            "cost": self.cost,
+            "success": self.success,
+            "status": self.status,
+            "message": self.message,
+            "iterations": self.iterations,
+            "function_evaluations": self.function_evaluations,
+        }
+
+
+class _ScalarSureScore:
+    """The existing scalar SURE objective, evaluated on a stable path.
+
+    With shrinkage weights ``w``, SURE_cost_fast and SURE_cost_colored (with
+    precomputed trace coefficients) equal ``w^T Q w + l^T w``. Their
+    omega != 0.5 term is reproduced as implemented: it scales
+    ``tr(G (D^T D + S) G)`` with ``G = (D^T D + lam S)^{-1}``.
+    """
+
+    def __init__(
+        self,
+        path: _PenaltyPath,
+        trace_coefficients: NDArray,
+        n_cols: int,
+        omega: float,
+        correction_variance: float,
+    ) -> None:
+        basis_gram = path.basis.T @ path.basis
+        quadratic = basis_gram * (path.rotated @ path.rotated.T)
+        self.path: _PenaltyPath = path
+        self.quadratic: NDArray = omega * quadratic
+        if abs(omega - 0.5) > 1e-5:
+            correction = (2 * omega - 1) * correction_variance * n_cols
+            self.quadratic -= np.diag(
+                correction * (1 + path.values) * np.diag(basis_gram)
+            )
+        self.linear: NDArray = (
+            2 * omega * (n_cols * trace_coefficients - quadratic.sum(axis=1))
+        )
+
+    def __call__(self, lam: float) -> float:
+        weights = self.path.weights(lam)
+        return float(weights @ self.quadratic @ weights + self.linear @ weights)
+
+    def log_derivative(self, log_lam: float) -> float:
+        weights, shrink = _shrinkage(self.path.values, float(np.exp(log_lam)))
+        gradient = 2.0 * self.quadratic @ weights + self.linear
+        return float(-(weights * shrink) @ gradient)
+
+
+class _ScalarSureSearch:
+    """Score scalar SURE candidates on log grids, recording every solve."""
+
+    def __init__(self, score: _ScalarSureScore) -> None:
+        self.score = score
+        self.evaluations = 0
+        self.nonfinite: list[dict[str, float | str]] = []
+        self.refinements: list[_SolveRecord] = []
+        self.roots: list[_SolveRecord] = []
+        self.limit_scores: dict[str, float] = {
+            "zero": self.evaluate(0.0),
+            "infinite": self.evaluate(np.inf),
+        }
+
+    def evaluate(self, lam: float) -> float:
+        self.evaluations += 1
+        value = self.score(lam)
+        if not np.isfinite(value):
+            self.nonfinite.append({"lambda": float(lam), "score": str(value)})
+            return np.inf
+        return value
+
+    def scan(self, name: str, lower: int, upper: int, per_decade: int) -> _ScalarScan:
+        grid = np.power(
+            10.0, np.linspace(lower, upper, (upper - lower) * per_decade + 1)
+        )
+        scores = np.array([self.evaluate(float(lam)) for lam in grid])
+        candidates: list[_ScalarCandidate] = [
+            (self.limit_scores["zero"], 0.0, "zero", 0),
+            (self.limit_scores["infinite"], np.inf, "infinite", 0),
+        ]
+        candidates += [
+            (float(score), float(lam), "grid", index)
+            for index, (lam, score) in enumerate(zip(grid, scores))
+        ]
+        candidates += self._refine(name, np.log(grid), scores)
+        candidates += self._stationary(name, np.log(grid))
+        finite = [row for row in candidates if np.isfinite(row[0])]
+        return _ScalarScan(grid, scores, min(finite) if finite else None)
+
+    def _refine(
+        self, name: str, log_grid: NDArray, scores: NDArray
+    ) -> list[_ScalarCandidate]:
+        found: list[_ScalarCandidate] = []
+        for bounds in _local_minimum_brackets(log_grid, scores):
+            result = sp.optimize.minimize_scalar(
+                lambda log_lam: self.evaluate(float(np.exp(log_lam))),
+                bounds=bounds,
+                method="bounded",
+                options={"xatol": 1e-10, "maxiter": 100, "disp": 0},
+            )
+            record = _SolveRecord(
+                name,
+                bounds,
+                float(np.exp(result.x)),
+                float(result.fun),
+                bool(result.success),
+                int(result.status),
+                str(result.message),
+                int(result.nit),
+                int(result.nfev),
+            )
+            self.refinements.append(record)
+            if np.isfinite(record.cost):
+                found.append(
+                    (record.cost, record.lam, "refinement", len(self.refinements) - 1)
+                )
+        return found
+
+    def _stationary(self, name: str, log_grid: NDArray) -> list[_ScalarCandidate]:
+        slopes = np.array([self.score.log_derivative(float(t)) for t in log_grid])
+        found: list[_ScalarCandidate] = []
+        for index in np.flatnonzero((slopes[:-1] < 0) & (slopes[1:] > 0)):
+            bounds = (float(log_grid[index]), float(log_grid[index + 1]))
+            root, report = sp.optimize.brentq(
+                self.score.log_derivative,
+                *bounds,
+                xtol=1e-12,
+                full_output=True,
+                disp=False,
+            )
+            lam = float(np.exp(root))
+            record = _SolveRecord(
+                name,
+                bounds,
+                lam,
+                self.evaluate(lam),
+                bool(report.converged),
+                0 if report.converged else 1,
+                str(report.flag),
+                int(report.iterations),
+                int(report.function_calls),
+            )
+            self.roots.append(record)
+            if np.isfinite(record.cost):
+                found.append((record.cost, lam, "stationary", len(self.roots) - 1))
+        return found
+
+
+def _scalar_stability(
+    path: _PenaltyPath, reference: _ScalarCandidate, check: _ScalarCandidate | None
+) -> dict[str, object]:
+    """Compare the selection from a check grid with the base selection."""
+    if check is None:
+        return {"passed": False, "error": "no finite candidate"}
+    energy = float(np.sum(path.ols**2))
+    score_change = _relative_change(abs(check[0] - reference[0]), energy)
+    template_change = path.template_change(check[1], reference[1])
+    return {
+        "lambda": check[1],
+        "selected_from": check[2],
+        "score_change_over_ols_energy": score_change,
+        "template_change_over_ols_norm": template_change,
+        "passed": score_change <= 1e-8 and template_change <= 1e-5,
+    }
+
+
+def _warn_scalar_search(
+    search: _ScalarSureSearch, stability: dict[str, dict[str, object]]
+) -> None:
+    if search.nonfinite:
+        first = search.nonfinite[0]
+        warnings.warn(
+            f"Scalar SURE excluded {len(search.nonfinite)} nonfinite objective "
+            f"evaluations; first at lambda={first['lambda']} "
+            f"(score={first['score']}). Returning the best finite candidate; "
+            "inspect numerical stability before using this fit.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    failed = {name: row for name, row in stability.items() if not row["passed"]}
+    if failed:
+        warnings.warn(
+            f"Scalar SURE selection is not stable under the {', '.join(failed)} "
+            "check: allowed changes are 1e-8 of the OLS template energy in score "
+            f"and 1e-5 of its norm in templates; got {failed}. Review this fit.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _scalar_search_diagnostics(
+    search: _ScalarSureSearch,
+    base: _ScalarScan,
+    selected: _ScalarCandidate,
+    stability: dict[str, dict[str, object]],
+    exponents: tuple[int, int],
+) -> dict[str, object]:
+    cost, lam, kind, index = selected
+    solves = search.refinements + search.roots
+    failures = [row for row in solves if not row.success]
+    message = (
+        f"All {len(solves)} refinements and root searches converged; "
+        "global optimum not certified."
+    )
+    if failures:
+        message = (
+            f"{len(failures)} of {len(solves)} refinements and root searches "
+            f"did not converge; first in the {failures[0].search} scan: "
+            f"{failures[0].message}"
+        )
+    bounds = (10.0 ** exponents[0], 10.0 ** exponents[1])
+    return {
+        "opt_val": lam,
+        "cost": cost,
+        "optimizer_success": not failures,
+        "optimizer_status": failures[0].status if failures else 0,
+        "optimizer_message": message,
+        "optimizer_iterations": sum(row.iterations for row in solves),
+        "optimizer_function_evaluations": search.evaluations,
+        "search_method": "grid_and_bounded_refinement",
+        "search_policy": "design_scaled_grid_with_zero_and_infinite_limits",
+        "search_bounds": bounds,
+        "search_log10_bounds": exponents,
+        "search_limit_scores": search.limit_scores,
+        "search_grid_lambdas": base.grid,
+        "search_grid_scores": base.scores,
+        "search_all_evaluations_finite": not search.nonfinite,
+        "search_nonfinite_evaluations": search.nonfinite,
+        "search_selected_from": kind,
+        "search_selected_index": index,
+        "search_near_lower_bound": lam <= bounds[0],
+        "search_near_upper_bound": lam >= bounds[1],
+        "search_refinements": [row.as_dict() for row in search.refinements],
+        "search_stationary_points": [row.as_dict() for row in search.roots],
+        "search_stability": stability,
+        "search_stability_passed": all(
+            bool(row["passed"]) for row in stability.values()
+        ),
+    }
+
+
+def _search_scalar_sure_path(
+    score: _ScalarSureScore,
+) -> tuple[float, dict[str, object]]:
+    """Search scalar SURE over [0, inf] on a design-scaled log grid.
+
+    The finite grid spans six decades beyond the penalty's first and last
+    transition scales at ten points per decade, and the exact lambda=0 and
+    infinite-penalty limits are candidates. Sampled local minima are refined
+    and derivative sign changes are root-bracketed in log lambda. Candidates
+    are compared by the SURE objective only, and exact ties select the smaller
+    lambda. A grid with 20 points per decade and one with two extra decades at
+    each end must reproduce the selection within 1e-8 of the OLS template
+    energy in score and 1e-5 of its norm in templates; otherwise the fit is
+    flagged with a warning. Nonfinite scores are excluded and reported; no
+    finite candidate is an explicit failure. A finite scan does not certify a
+    global optimum.
+    """
+    search = _ScalarSureSearch(score)
+    lower, upper = score.path.log10_envelope()
+    base = search.scan("base", lower, upper, 10)
+    selected = base.selected
+    if selected is None:
+        raise ValueError(
+            "Scalar SURE search found no finite candidate after "
+            f"{search.evaluations} objective evaluations on [0, inf]"
+        )
+    checks = {
+        "denser": search.scan("denser", lower, upper, 20),
+        "outer": search.scan("outer", lower - 2, upper + 2, 10),
+    }
+    stability = {
+        name: _scalar_stability(score.path, selected, check.selected)
+        for name, check in checks.items()
+    }
+    _warn_scalar_search(search, stability)
+    diagnostics = _scalar_search_diagnostics(
+        search, base, selected, stability, (lower, upper)
+    )
+    return selected[1], diagnostics
+
+
+def _scalar_sure_score(
+    path: _PenaltyPath,
+    n_cols: int,
+    sigsq: float,
+    omega: float,
+    DtSigmaD: NDArray | None,
+) -> _ScalarSureScore:
+    """Build the white (*DtSigmaD* None) or colored scalar SURE objective."""
+    if DtSigmaD is None:
+        trace = sigsq * np.sum(path.basis**2, axis=0)
+        return _ScalarSureScore(path, trace, n_cols, omega, sigsq)
+    inverse_basis = sp.linalg.cho_solve((path.chol, True), path.basis)
+    trace = np.sum(path.basis * (DtSigmaD @ inverse_basis), axis=0)
+    variance = float(np.trace(DtSigmaD)) / len(trace)
+    return _ScalarSureScore(path, trace, n_cols, omega, variance)
 
 
 def _optimize_lambda(
     data: NDArray,
     a: scipy.sparse.spmatrix,
     b: scipy.sparse.spmatrix,
-    d: scipy.sparse.spmatrix,
-    temporal_mat: scipy.sparse.spmatrix,
-    l2_mat: scipy.sparse.spmatrix,
+    temporal_factor: NDArray,
     ix: NDArray,
     lb: NDArray,
     events: NDArray,
     half_win: int,
-    reg_l2: float,
     noise_est: str,
     omega: float,
     verbose: bool,
-    data_raw: NDArray | None,
-    bandpass: tuple[float, float] | None,
-    fs: float | None,
-    noise_band: tuple[float, float] | None,
-) -> tuple[float, dict[str, object]]:
+    event_blocks: NDArray | None = None,
+    ar1: _AR1Noise | None = None,
+) -> tuple[float, dict[str, object], _PenaltyPath]:
     """Optimize the scalar lambda via SURE.
 
-    Returns the optimal regularization strength and a diagnostics dict.
+    Search [0, inf] on a design-scaled grid of a stable path built from
+    ``temporal_factor`` (``F^T F`` is the temporal penalty), which is also
+    returned for computing the templates. Return the best evaluated
+    candidate and all stopping reports, including unsuccessful ones.
+    *event_blocks* labels each event's recording block for the colored
+    covariance; *ar1* holds explicit AR(1) inputs.
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
-
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    from scipy.optimize import minimize_scalar
-
+    if event_blocks is not None:
+        _check_block_noise(noise_est, lb, half_win)
     sigsq = est_noise_var(
         data,
         method=noise_est
         if noise_est not in {"ar1_colored", "ar3_colored"}
         else "baseline",
-        DtD=a,
-        DtX=b,
-        S=temporal_mat,
-        X=data,
-        D=d,
         ix=ix,
         lb=lb,
         half_win=half_win,
-        data_raw=data_raw,
-        bandpass=bandpass,
-        fs=fs,
-        noise_band=noise_band,
     )
 
-    # Use fast eigendecomposition-based SURE when no L2 mixing
-    if reg_l2 == 0:
-        DtD_dense = np.asarray(a.todense() if sp.sparse.issparse(a) else a, dtype=float)
-        S_dense = np.asarray(
-            temporal_mat.todense()
-            if sp.sparse.issparse(temporal_mat)
-            else temporal_mat,
-            dtype=float,
+    path = _PenaltyPath(_dense(a), _dense(b), temporal_factor)
+    colored = _colored_covariance(
+        data, ix, lb, events, half_win, noise_est, sigsq, event_blocks, ar1
+    )
+    sigsq, record = colored.noise_var, colored.record
+    n_cols = data.shape[1] if data.ndim > 1 else 1
+    score = _scalar_sure_score(path, n_cols, sigsq, omega, colored.covariance)
+    reg_temporal, inner = _search_scalar_sure_path(score)
+
+    inner["noise_var"] = sigsq
+    inner.update(record)
+    if not inner["optimizer_success"]:
+        warnings.warn(
+            "SURE(lambda) stopped without converging: "
+            f"{inner['optimizer_message']} (status={inner['optimizer_status']}, "
+            f"function evaluations={inner['optimizer_function_evaluations']}, "
+            f"returned lambda={reg_temporal}).",
+            RuntimeWarning,
+            stacklevel=2,
         )
-        DtX_dense = np.asarray(b.todense() if sp.sparse.issparse(b) else b, dtype=float)
-
-        mu, V = sp.linalg.eigh(DtD_dense, DtD_dense + S_dense)
-        mu = np.clip(mu, 0, 1)
-        DtX_rot = V.T @ DtX_dense
-        theta_ml_dense = np.linalg.solve(DtD_dense, DtX_dense)
-        n_obs = data.shape[0]
-        n_cols = data.shape[1] if data.ndim > 1 else 1
-
-        if noise_est in {"ar1_colored", "ar3_colored"}:
-            if noise_est == "ar1_colored":
-                phi = estimate_phi(data, ix, half_win)
-                DtSigmaD = build_DtSigmaD_ar1(
-                    ix,
-                    lb,
-                    events,
-                    half_win,
-                    phi,
-                    sigsq,
-                    data_length=len(data),
-                )
-            else:
-                acf = estimate_acf_ar(data, ix, half_win, ar_order=3)
-                DtSigmaD = build_DtSigmaD_acf(
-                    ix, lb, events, half_win, acf, data_length=len(data)
-                )
-            precomp = precompute_colored_trace(DtD_dense, DtSigmaD, V, mu)
-            opt_res = minimize_scalar(
-                SURE_cost_colored,
-                bounds=(0, 1e5),
-                method="bounded",
-                args=(
-                    mu,
-                    DtX_rot,
-                    V,
-                    theta_ml_dense,
-                    DtSigmaD,
-                    n_obs,
-                    n_cols,
-                    omega,
-                    None,
-                    None,
-                    precomp,
-                ),
-                options={"xatol": 1e-02, "maxiter": 25, "disp": 0},
-            )
-        else:
-            opt_res = minimize_scalar(
-                SURE_cost_fast,
-                bounds=(0, 1e5),
-                method="bounded",
-                args=(
-                    mu,
-                    DtX_rot,
-                    V,
-                    theta_ml_dense,
-                    sigsq,
-                    n_obs,
-                    n_cols,
-                    omega,
-                ),
-                options={"xatol": 1e-02, "maxiter": 25, "disp": 0},
-            )
-    else:
-        # Fallback to original SURE with L2 mixing
-        theta_ml = np.linalg.inv(a.todense()) @ b
-        Dpinv = np.linalg.inv(a.todense()) @ d.todense().T
-        DpinvX = Dpinv @ data
-        opt_res = minimize_scalar(
-            SURE_cost,
-            bounds=(0, 1e5),
-            method="bounded",
-            args=(
-                a.todense(),
-                d.todense(),
-                Dpinv,
-                DpinvX,
-                temporal_mat.todense(),
-                theta_ml,
-                data,
-                sigsq,
-                reg_l2,
-                l2_mat.todense(),
-                omega,
-            ),
-            options={"xatol": 1e-02, "maxiter": 25, "disp": 0},
-        )
-
-    reg_temporal = opt_res.x
 
     if verbose:
         print(f"tmp_reg: {reg_temporal}")
         print(f"noise var: {sigsq}")
 
-    inner: dict[str, object] = {
-        "opt_val": reg_temporal,
-        "noise_var": sigsq,
-        "cost": opt_res.fun,
-    }
-    return reg_temporal, inner
+    return reg_temporal, inner, path
+
+
+# Estimators that filter, or pair adjacent samples, across a block join.
+_JOINED_NOISE_ESTIMATORS = frozenset({"hpf"})
+
+
+def _event_blocks_from_starts(
+    block_starts: NDArray, ix: NDArray, half_win: int, n_samples: int
+) -> NDArray:
+    """Validate concatenated-block starts and label each event by its block."""
+    starts = np.asarray(block_starts)
+    if starts.ndim != 1 or starts.size == 0:
+        raise ValueError(
+            f"block_starts must be a nonempty 1-D array, got shape {starts.shape}"
+        )
+    if not np.issubdtype(starts.dtype, np.integer):
+        raise ValueError(
+            f"block_starts must contain integers, got dtype {starts.dtype}"
+        )
+    if starts[0] != 0:
+        raise ValueError(f"block_starts must begin at 0, got {starts[0]}")
+    # Compare without subtraction, so unsigned and narrow integers cannot wrap.
+    if np.any(starts[1:] <= starts[:-1]):
+        raise ValueError(f"block_starts must be strictly increasing, got {starts}")
+    if starts[-1] >= n_samples:
+        raise ValueError(
+            f"The last block start {starts[-1]} leaves no samples before the "
+            f"data length {n_samples}"
+        )
+    onsets = np.asarray(ix)
+    if not np.issubdtype(onsets.dtype, np.integer):
+        raise ValueError(
+            f"ix must contain integers with block_starts, got dtype {onsets.dtype}"
+        )
+    for name, outside in (
+        ("starts before sample 0", onsets < half_win),
+        (f"ends after the data length {n_samples}", onsets > n_samples - half_win),
+    ):
+        if np.any(outside):
+            event = int(np.flatnonzero(outside)[0])
+            raise ValueError(
+                f"Event {event} at sample {onsets[event]}: its window {name}"
+            )
+    # Both are now bounded by n_samples.
+    starts = starts.astype(np.int64)
+    first = onsets.astype(np.int64) - half_win
+    last = first + 2 * half_win - 1
+    blocks = np.searchsorted(starts, first, side="right") - 1
+    crossing = blocks != np.searchsorted(starts, last, side="right") - 1
+    if np.any(crossing):
+        event = int(np.flatnonzero(crossing)[0])
+        raise ValueError(
+            f"Event {event} at sample {ix[event]}: its window "
+            f"[{first[event]}, {last[event] + 1}) crosses the block start "
+            f"{starts[blocks[event] + 1]}"
+        )
+    return blocks
+
+
+def _check_block_noise(noise_est: str, lb: NDArray, half_win: int) -> None:
+    """Reject noise estimates that would mix samples across block joins."""
+    if noise_est in _JOINED_NOISE_ESTIMATORS:
+        raise ValueError(
+            f"noise_est={noise_est!r} filters or pairs samples across block "
+            "joins and is not supported with block_starts"
+        )
+    _, counts = np.unique(lb, return_counts=True)
+    if noise_est == "pairwise" and not np.any(counts >= 2):
+        raise ValueError(
+            "Pairwise noise estimation needs two events of one label; its HPF "
+            "fallback crosses block joins and is not supported with block_starts"
+        )
+    # Shortest baseline segments of estimate_phi and estimate_acf_ar.
+    baseline = {"ar1_colored": 4, "ar3_colored": 7}.get(noise_est, 0)
+    if baseline > 2 * half_win:
+        raise ValueError(
+            f"noise_est={noise_est!r} uses baseline segments of at least "
+            f"{baseline} samples, longer than the {2 * half_win}-sample window, "
+            "so they can cross block joins"
+        )
+
+
+def _real_value(argument: str, value: object) -> float:
+    """Require a real scalar and convert it to float before any check or use."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError(
+            f"{argument} must be a real number, got {type(value).__name__} {value!r}"
+        )
+    try:
+        return float(value)
+    except OverflowError as error:
+        raise ValueError(
+            f"{argument} must be finite, got an integer beyond the float range"
+        ) from error
+
+
+def _real_ar1(ar1: _AR1Noise) -> _AR1Noise:
+    """Explicit AR(1) inputs as floats; *None* stays for phi and variance."""
+    return _AR1Noise(
+        None if ar1.phi is None else _real_value("ar1_phi", ar1.phi),
+        None if ar1.noise_var is None else _real_value("ar1_noise_var", ar1.noise_var),
+        _real_value("noise_var_scale", ar1.noise_var_scale),
+    )
+
+
+def _check_ar1_values(ar1: _AR1Noise) -> None:
+    """Reject explicit AR(1) inputs outside a stationary, positive model."""
+    if ar1.phi is not None:
+        if not np.isfinite(ar1.phi):
+            raise ValueError(f"ar1_phi must be finite, got {ar1.phi!r}")
+        if ar1.phi < 0:
+            raise ValueError(f"ar1_phi must be >= 0, got {ar1.phi!r}")
+        if ar1.phi >= 1:
+            raise ValueError(
+                f"ar1_phi must be < 1 for a stationary AR(1) covariance, got {ar1.phi!r}"
+            )
+    if ar1.noise_var is not None:
+        if not np.isfinite(ar1.noise_var):
+            raise ValueError(f"ar1_noise_var must be finite, got {ar1.noise_var!r}")
+        if ar1.noise_var <= 0:
+            raise ValueError(f"ar1_noise_var must be > 0, got {ar1.noise_var!r}")
+    if not np.isfinite(ar1.noise_var_scale):
+        raise ValueError(f"noise_var_scale must be finite, got {ar1.noise_var_scale!r}")
+    if ar1.noise_var_scale <= 0:
+        raise ValueError(f"noise_var_scale must be > 0, got {ar1.noise_var_scale!r}")
+    if ar1.noise_var is not None and ar1.noise_var_scale != 1:
+        raise ValueError(
+            f"ar1_noise_var={ar1.noise_var!r} and "
+            f"noise_var_scale={ar1.noise_var_scale!r} are mutually exclusive: "
+            "a non-unit scale applies only to the estimated variance"
+        )
+
+
+def _check_ar1_context(
+    method: str,
+    opt_reg_temporal: bool,
+    reg_method: str | None,
+    noise_est: str,
+) -> None:
+    """Reject explicit AR(1) inputs where no AR(1)-colored SURE uses them."""
+    where = (
+        "ar1_phi, ar1_noise_var and noise_var_scale apply only to AR(1)-colored SURE"
+    )
+    if method != "ls":
+        raise ValueError(f"{where}, which needs method='ls'; got method={method!r}")
+    if not opt_reg_temporal:
+        raise ValueError(
+            f"{where}, which needs opt_reg_temporal=True; "
+            f"got opt_reg_temporal={opt_reg_temporal!r}"
+        )
+    if reg_method is not None:
+        raise ValueError(
+            f"{where}, which needs reg_method=None; got reg_method={reg_method!r}"
+        )
+    if noise_est != "ar1_colored":
+        raise ValueError(
+            f"{where}, which needs noise_est='ar1_colored'; got noise_est={noise_est!r}"
+        )
+
+
+def _ar1_inputs(
+    ar1: _AR1Noise,
+    method: str,
+    opt_reg_temporal: bool,
+    reg_method: str | None,
+    noise_est: str,
+) -> _AR1Noise | None:
+    """Validate explicit AR(1) inputs as floats; *None* when all are defaults."""
+    ar1 = _real_ar1(ar1)
+    if ar1.phi is None and ar1.noise_var is None and ar1.noise_var_scale == 1:
+        return None
+    _check_ar1_values(ar1)
+    _check_ar1_context(method, opt_reg_temporal, reg_method, noise_est)
+    return ar1
 
 
 # --- Main template estimation function ---
@@ -2619,7 +2732,6 @@ def get_events_templates(
     half_win: int = 100,
     method: str = "average",
     reg_temporal: float = 0,
-    reg_l2: float = 0,
     batch_size: int | None = None,
     opt_reg_temporal: bool = False,
     omega: float = 0.5,
@@ -2629,10 +2741,11 @@ def get_events_templates(
     verbose: bool = False,
     reg_method: str | None = None,
     noise_est: str = "pairwise",
-    data_raw: NDArray | None = None,
-    bandpass: tuple[float, float] | None = None,
-    fs: float | None = None,
-    noise_band: tuple[float, float] | None = None,
+    block_starts: NDArray | None = None,
+    *,
+    ar1_phi: float | None = None,
+    ar1_noise_var: float | None = None,
+    noise_var_scale: float = 1.0,
 ) -> tuple[dict[object, NDArray], dict[str, object] | None]:
     """Estimate event templates from continuous data.
 
@@ -2656,8 +2769,6 @@ def get_events_templates(
     reg_temporal : float
         Fixed temporal regularization strength (used when *opt_reg_temporal*
         is *False* and *reg_method* is *None*).
-    reg_l2 : float
-        L2 (count-weighted identity) regularization mixing weight in [0, 1].
     batch_size : int | None
         Number of samples per batch for design-matrix accumulation.  If
         *None*, processes the full signal in one pass.
@@ -2678,14 +2789,35 @@ def get_events_templates(
         Takes precedence over *opt_reg_temporal*.
     noise_est : str
         Noise estimation method passed to :func:`est_noise_var`.
-    data_raw : NDArray | None
-        Raw data for out-of-band noise estimation.
-    bandpass : tuple[float, float] | None
-        Working signal band for out-of-band noise estimation.
-    fs : float | None
-        Sampling frequency for out-of-band noise estimation.
-    noise_band : tuple[float, float] | None
-        Noise estimation band for out-of-band estimation.
+    block_starts : NDArray | None
+        For separately recorded blocks concatenated in *data*: the integer
+        sample index where each block begins, strictly increasing from 0; the
+        last block ends at ``len(data)``. Every event window must lie inside
+        one block. Colored-noise SURE then omits covariance between events of
+        different blocks, and noise estimators that filter or pair samples
+        across joins (``'hpf'`` and the HPF
+        fallback of ``'pairwise'``) raise, as do colored estimates whose
+        baseline segments are longer than the window. *None* treats *data* as
+        one continuous recording.
+    ar1_phi : float | None
+        AR(1) coefficient for the colored covariance, in ``[0, 1)``, used
+        as given (no 0.99 cap) instead of :func:`estimate_phi`.
+    ar1_noise_var : float | None
+        Marginal AR(1) noise variance (> 0) used instead of the baseline
+        estimate.
+    noise_var_scale : float
+        Factor (> 0) on the baseline variance estimate; a value other than
+        1 excludes *ar1_noise_var*. The three AR(1) inputs must be real
+        scalars (bools and other types raise TypeError) and are converted to
+        float before they are checked and used. Nondefault values
+        apply only to AR(1)-colored SURE: ``method='ls'``,
+        ``opt_reg_temporal=True``, ``reg_method=None`` and
+        ``noise_est='ar1_colored'`` (scalar or kernel); other settings
+        raise. AR(1) SURE records ``phi_estimated``, ``phi_used``,
+        ``noise_var_estimated`` and ``noise_var_scale`` in *inner*, with
+        ``noise_var`` the variance used. AR(3) SURE records the fitted
+        autocovariance as ``ar3_acf``: through the largest event-pair lag,
+        so up to the recording length (only lag 0 without baselines).
 
     Returns
     -------
@@ -2694,18 +2826,26 @@ def get_events_templates(
         of shape ``(2 * half_win, C)``, and *inner* holds optimization
         diagnostics (or *None* for simple averaging / fixed regularization).
     """
-    # Deferred: not compatible with Cinder lazy imports (loaded eagerly otherwise).
-    import scipy as sp
 
+    ar1 = _ar1_inputs(
+        _AR1Noise(ar1_phi, ar1_noise_var, noise_var_scale),
+        method,
+        opt_reg_temporal,
+        reg_method,
+        noise_est,
+    )
     inner = None
+    event_blocks = (
+        None
+        if block_starts is None
+        else _event_blocks_from_starts(block_starts, ix, half_win, len(data))
+    )
 
     if method == "average":
         X = epoch_data(data, ix, tmax=half_win, tmin=-half_win)
         return {str(label): X[lb == label].mean(0) for label in np.unique(lb)}, inner
 
     elif method == "ls":
-        assert (reg_l2 >= 0) & (reg_l2 <= 1)
-
         events = np.unique(lb)
         M = len(events)
         T = 2 * half_win
@@ -2737,17 +2877,17 @@ def get_events_templates(
         R = sp.linalg.convolution_matrix([1, -2, 1], T - 2)
         RR = R @ R.T
 
-        l2_mat = sp.sparse.block_diag(
-            [np.eye(T) * c for _, c in zip(*np.unique(lb, return_counts=True))],
-            format="csr",
-        )
         temporal_mat = sp.sparse.block_diag([RR] * M, format="csr")
+        # Exact factor: its null space is the structural constant/linear trend.
+        temporal_factor = sp.linalg.block_diag(*([R.T] * M))
 
+        path: _PenaltyPath | None = None
         if reg_method in {"gcv", "lcurve", "empbayes"}:
             if reg_method == "gcv":
                 reg_temporal, inner = select_lambda_gcv(a, b, temporal_mat, data, d)
             elif reg_method == "lcurve":
-                reg_temporal, inner = select_lambda_lcurve(a, b, temporal_mat, data, d)
+                path = _PenaltyPath(_dense(a), _dense(b), temporal_factor)
+                reg_temporal, inner = _select_lcurve(path, data, d)
             elif reg_method == "empbayes":
                 reg_temporal, inner = select_lambda_empbayes(
                     a, b, temporal_mat, data, d
@@ -2759,8 +2899,6 @@ def get_events_templates(
                     data=data,
                     a=a,
                     b=b,
-                    d=d,
-                    temporal_mat=temporal_mat,
                     ix=ix,
                     lb=lb,
                     events=events,
@@ -2772,36 +2910,30 @@ def get_events_templates(
                     vlen=vlen,
                     symm=symm,
                     verbose=verbose,
-                    data_raw=data_raw,
-                    bandpass=bandpass,
-                    fs=fs,
-                    noise_band=noise_band,
+                    event_blocks=event_blocks,
+                    ar1=ar1,
                 )
             else:
-                reg_temporal, inner = _optimize_lambda(
+                reg_temporal, inner, path = _optimize_lambda(
                     data=data,
                     a=a,
                     b=b,
-                    d=d,
-                    temporal_mat=temporal_mat,
-                    l2_mat=l2_mat,
+                    temporal_factor=temporal_factor,
                     ix=ix,
                     lb=lb,
                     events=events,
                     half_win=half_win,
-                    reg_l2=reg_l2,
                     noise_est=noise_est,
                     omega=omega,
                     verbose=verbose,
-                    data_raw=data_raw,
-                    bandpass=bandpass,
-                    fs=fs,
-                    noise_band=noise_band,
+                    event_blocks=event_blocks,
+                    ar1=ar1,
                 )
 
-        templates = sp.sparse.linalg.spsolve(
-            (1 - reg_l2) * (a) + reg_l2 * l2_mat + reg_temporal * temporal_mat, b
-        ).T
+        if path is not None:
+            templates = path.templates(reg_temporal).T
+        else:
+            templates = sp.sparse.linalg.spsolve(a + reg_temporal * temporal_mat, b).T
 
         templates = templates.reshape(data.shape[1], M, T).transpose(1, 2, 0)
 
